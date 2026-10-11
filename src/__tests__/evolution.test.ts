@@ -1,5 +1,5 @@
-import { checkEvolution, checkMilestones, awardXp } from "../engine/evolution.js";
-import type { PetState, PromptScore, CreatureStage } from "../types.js";
+import { checkEvolution, checkMilestones, awardXp, awardPromptXp, resolveLine, nextStageXp } from "../engine/evolution.js";
+import type { PetState, PromptScore, CreatureStage, CreatureRegistry } from "../types.js";
 
 const MOCK_STAGES: CreatureStage[] = [
   { id: "egg", name: "Egg", level: 1, xpRequired: 0, personality: "", speechStyle: "", art: [], suggestions: { specificity: [], context: [], actionability: [], scope: [], constraints: [] } },
@@ -52,11 +52,12 @@ describe("checkEvolution", () => {
 });
 
 describe("awardXp", () => {
-  it("should add xp to state and increment totalPromptsScored", () => {
+  it("should add xp without counting a scored prompt", () => {
     const state = makeState({ xp: 50, totalPromptsScored: 5 });
     awardXp(state, 15);
     expect(state.xp).toBe(65);
-    expect(state.totalPromptsScored).toBe(6);
+    // Commits and test runs go through awardXp — they are not prompts
+    expect(state.totalPromptsScored).toBe(5);
   });
 
   it("should update streak on new day", () => {
@@ -76,6 +77,54 @@ describe("awardXp", () => {
     });
     awardXp(state, 10, "2026-04-08");
     expect(state.streakDays).toBe(1);
+  });
+});
+
+describe("awardPromptXp", () => {
+  it("should count the prompt as well as its xp", () => {
+    const state = makeState({ xp: 10, totalPromptsScored: 5 });
+    awardPromptXp(state, 8);
+    expect(state.xp).toBe(18);
+    expect(state.totalPromptsScored).toBe(6);
+  });
+
+  it("should walk the 100_prompts milestone off real prompts, not commits", () => {
+    const state = makeState({ totalPromptsScored: 99, milestonesCompleted: [] });
+    awardXp(state, 5); // a commit
+    expect(checkMilestones(state, 50).some((m) => m.id === "100_prompts")).toBe(false);
+    awardPromptXp(state, 5); // the 100th prompt
+    expect(checkMilestones(state, 50).some((m) => m.id === "100_prompts")).toBe(true);
+  });
+});
+
+describe("resolveLine", () => {
+  const registry: CreatureRegistry = {
+    evolutionLines: {
+      titan: { stages: MOCK_STAGES },
+      swarm: { stages: MOCK_STAGES },
+    },
+  };
+
+  it("should return the pet's own line", () => {
+    const state = makeState({ currentLineId: "swarm" });
+    expect(resolveLine(registry, state).stages).toBe(MOCK_STAGES);
+    expect(state.currentLineId).toBe("swarm");
+  });
+
+  it("should repair a line id the registry does not know", () => {
+    const state = makeState({ currentLineId: "default" });
+    expect(() => resolveLine(registry, state).stages).not.toThrow();
+    expect(state.currentLineId).toBe("titan");
+  });
+});
+
+describe("nextStageXp", () => {
+  it("should return the following stage threshold", () => {
+    expect(nextStageXp(MOCK_STAGES, 0)).toBe(100);
+  });
+
+  it("should return -1 at the final stage", () => {
+    expect(nextStageXp(MOCK_STAGES, MOCK_STAGES.length - 1)).toBe(-1);
   });
 });
 

@@ -11,6 +11,9 @@
 
 input=$(cat)
 
+PET_DIR="$HOME/.claude/claude-pet"
+PET_CONFIG="$PET_DIR/config.json"
+
 # Refresh FX / model pricing in background if cache stale (non-blocking)
 FX_UPDATER="${PET_FX_UPDATE_SCRIPT:-$HOME/.claude/claude-pet/update-fx-rate.sh}"
 if [[ "${PET_FX_UPDATE:-1}" != "0" && -x "$FX_UPDATER" ]]; then
@@ -23,40 +26,56 @@ fi
 
 # ── Parse JSON ───────────────────────────────────────────────────────────────
 # Claude Code statusline protocol: https://code.claude.com/docs/en/statusline
-MODEL=$(echo "$input"    | jq -r '.model.display_name // "Claude"')
-MODEL_ID=$(echo "$input" | jq -r '.model.id // empty')
-SESSION_ID=$(echo "$input" | jq -r '.session_id // .sessionId // empty')
-DIR=$(echo "$input"      | jq -r '.workspace.current_dir // .cwd // ""')
-PCT=$(echo "$input"      | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
-CTX_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
-# Prefer live current_usage (input+cache); fallback to total_input_tokens
-CTX_USED=$(echo "$input" | jq -r '
-  def n(x): (x // 0);
-  if (.context_window.current_usage != null) then
-    n(.context_window.current_usage.input_tokens)
-    + n(.context_window.current_usage.cache_creation_input_tokens)
-    + n(.context_window.current_usage.cache_read_input_tokens)
-  else
-    n(.context_window.total_input_tokens)
-  end
-')
-CACHE_READ=$(echo "$input"   | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
-OUT_TOK=$(echo "$input"      | jq -r '.context_window.total_output_tokens // .context_window.current_usage.output_tokens // 0')
-USAGE_IN=$(echo "$input"     | jq -r '.context_window.current_usage.input_tokens // 0')
-USAGE_CC=$(echo "$input"     | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-USAGE_CR=$(echo "$input"     | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
-USAGE_OUT=$(echo "$input"    | jq -r '.context_window.current_usage.output_tokens // 0')
-COST=$(echo "$input"         | jq -r '.cost.total_cost_usd // 0')
-DUR_MS=$(echo "$input"       | jq -r '.cost.total_duration_ms // 0')
-LINES_ADD=$(echo "$input"    | jq -r '.cost.total_lines_added // 0')
-LINES_DEL=$(echo "$input"    | jq -r '.cost.total_lines_removed // 0')
+# One jq call for all fields: the status line re-runs constantly and each jq is
+# a process. Fields are joined with \x1f, not @tsv — IFS treats tab as a
+# whitespace char, so it would collapse an empty field (model.id usually is
+# one) and shift every value after it.
+parse_status() {
+  jq -r '
+    def n(x): (x // 0) | if type == "number" then . else 0 end;
+    def i(x): n(x) | floor;
+    . as $in
+    | ($in.context_window.current_usage) as $cu
+    | [
+        ($in.model.display_name // "Claude"),
+        ($in.model.id // ""),
+        ($in.session_id // $in.sessionId // ""),
+        ($in.workspace.current_dir // $in.cwd // ""),
+        i($in.context_window.used_percentage),
+        i($in.context_window.context_window_size),
+        # Prefer live current_usage (input+cache); fallback to total_input_tokens
+        (if $cu != null then
+           i($cu.input_tokens) + i($cu.cache_creation_input_tokens) + i($cu.cache_read_input_tokens)
+         else i($in.context_window.total_input_tokens) end),
+        i($cu.cache_read_input_tokens),
+        i($in.context_window.total_output_tokens // $cu.output_tokens),
+        i($cu.input_tokens),
+        i($cu.cache_creation_input_tokens),
+        i($cu.cache_read_input_tokens),
+        i($cu.output_tokens),
+        n($in.cost.total_cost_usd),
+        i($in.cost.total_duration_ms),
+        i($in.cost.total_lines_added),
+        i($in.cost.total_lines_removed)
+      ]
+    | map(tostring) | join("\u001f")
+  '
+}
+
+PARSE=$(parse_status <<< "$input")
+# Malformed input: re-parse an empty object so every field still gets a sane default
+[[ -n "$PARSE" ]] || PARSE=$(parse_status <<< '{}')
+
+IFS=$'\x1f' read -r \
+  MODEL MODEL_ID SESSION_ID DIR PCT CTX_SIZE CTX_USED CACHE_READ OUT_TOK \
+  USAGE_IN USAGE_CC USAGE_CR USAGE_OUT COST DUR_MS LINES_ADD LINES_DEL \
+  <<< "$PARSE"
 
 # Optional local $/MTok estimate (auto-updated); may undercount — see README
-PET_CONFIG_EARLY="$HOME/.claude/claude-pet/config.json"
-COST_STATE="$HOME/.claude/claude-pet/cost-state.json"
-if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG_EARLY" ]] && command -v python3 >/dev/null 2>&1; then
+COST_STATE="$PET_DIR/cost-state.json"
+if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG" ]] && command -v python3 >/dev/null 2>&1; then
   COST_CUSTOM=$(
-    PET_COST_STATE="$COST_STATE" python3 - "$PET_CONFIG_EARLY" \
+    PET_COST_STATE="$COST_STATE" python3 - "$PET_CONFIG" \
       "${MODEL_ID:-}" "${MODEL:-}" "${SESSION_ID:-}" \
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
       "${COST:-0}" <<'PY'
@@ -167,48 +186,88 @@ PY
   [[ -n "$COST_CUSTOM" ]] && COST="$COST_CUSTOM"
 fi
 
+# 15500 -> 15.5k, 200000 -> 200.0k, 1000000 -> 1.0M. Pure bash: awk here would be
+# a fork per call, four per render. Rounds to one decimal like printf %.1f did.
 fmt_tokens() {
-  # 15500 -> 15.5k, 200000 -> 200k, 1000000 -> 1.0M
-  local n="${1:-0}"
-  awk -v n="$n" 'BEGIN{
-    n+=0
-    if (n>=1000000) printf "%.1fM", n/1000000
-    else if (n>=1000) printf "%.1fk", n/1000
-    else printf "%d", n
-  }'
+  local n=${1:-0} r
+  (( n < 0 )) && n=0
+  if (( n >= 1000000 )); then
+    r=$(( (n + 50000) / 100000 * 100000 ))
+    printf '%d.%dM' $(( r / 1000000 )) $(( (r % 1000000) / 100000 ))
+  elif (( n >= 1000 )); then
+    r=$(( (n + 50) / 100 * 100 ))
+    printf '%d.%dk' $(( r / 1000 )) $(( (r % 1000) / 100 ))
+  else
+    printf '%d' "$n"
+  fi
   return 0
 }
 
-# ── Dir: shorten to ~/parent/dir ─────────────────────────────────────────────
-DIR="${DIR/#$HOME/~}"
-NSEGS=$(echo "$DIR" | tr -cd '/' | wc -c | tr -d ' ')
-if [[ "$NSEGS" -gt 2 ]]; then
-  PARENT=$(echo "$DIR" | awk -F/ '{print $(NF-1)}')
-  LEAF=$(echo "$DIR"   | awk -F/ '{print $NF}')
-  DIR_DISPLAY="~/${PARENT}/${LEAF}"
-else
-  DIR_DISPLAY="$DIR"
+# ── Dir + git branch (one git call) ──────────────────────────────────────────
+# In a repo:  repo root name + subpath            →  claudePet/src/engine
+# Otherwise:  last two segments, elision marked   →  ~/…/claude/claudePet
+# --show-toplevel goes first: on an unborn branch --abbrev-ref fails (exit 128)
+# and aborts the remaining args, which would drop the repo root too.
+GIT_DIR="$DIR"
+REPO_ROOT=""
+BRANCH=""
+while IFS= read -r line; do
+  if [[ "$line" == /* ]]; then REPO_ROOT="$line"   # toplevel is always absolute
+  elif [[ -n "$line" ]]; then BRANCH="$line"; fi
+done < <(git -C "$GIT_DIR" rev-parse --show-toplevel --abbrev-ref HEAD 2>/dev/null)
+# Unborn branch (fresh `git init`) reports "HEAD" — resolve the real name
+if [[ "$BRANCH" == "HEAD" ]]; then
+  BRANCH=$(git -C "$GIT_DIR" symbolic-ref --short HEAD 2>/dev/null) || BRANCH="HEAD"
 fi
 
-# ── Git branch ───────────────────────────────────────────────────────────────
-GIT_DIR="${DIR/#\~/$HOME}"
-BRANCH=$(git -C "$GIT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+fmt_dir() {
+  local dir="$1" root="$2" rel shown prefix slashes parent leaf
+  if [[ -n "$root" ]] && [[ "$dir" == "$root" || "$dir" == "$root"/* ]]; then
+    rel="${dir#"$root"}"
+    printf '%s%s' "${root##*/}" "$rel"
+    return 0
+  fi
+  # Outside a repo: "~" keeps it readable, "/" keeps it absolute
+  if [[ "$dir" == "$HOME" || "$dir" == "$HOME"/* ]]; then
+    prefix="~"; shown="${dir#"$HOME"}"
+  else
+    prefix=""; shown="$dir"
+  fi
+  # Pure bash (no tr/wc/awk forks): strip every non-slash to count the depth
+  slashes="${shown//[!\/]/}"
+  if (( ${#slashes} > 2 )); then
+    parent="${shown%/*}"; parent="${parent##*/}"
+    leaf="${shown##*/}"
+    printf '%s/…/%s/%s' "$prefix" "$parent" "$leaf"
+  else
+    printf '%s%s' "$prefix" "$shown"
+  fi
+}
+DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")
 
 # ── Cost / duration / lines ──────────────────────────────────────────────────
 # Currency: Claude reports USD. Optional FX via env or ~/.claude/claude-pet/config.json:
 #   env:  PET_COST_CURRENCY=CNY  PET_USD_RATE=7.2  PET_COST_SHOW_USD=1
 #   json: "currency": { "code":"CNY", "symbol":"¥", "usd_rate":7.2, "show_usd":false }
-PET_CONFIG_EARLY="$HOME/.claude/claude-pet/config.json"
-COST_CURRENCY="${PET_COST_CURRENCY:-}"
-USD_RATE="${PET_USD_RATE:-}"
-COST_SHOW_USD="${PET_COST_SHOW_USD:-}"
-COST_SYMBOL=""
-if [[ -f "$PET_CONFIG_EARLY" ]]; then
-  [[ -z "$COST_CURRENCY" ]] && COST_CURRENCY=$(jq -r '.currency.code // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
-  [[ -z "$USD_RATE" ]] && USD_RATE=$(jq -r '.currency.usd_rate // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
-  [[ -z "$COST_SHOW_USD" ]] && COST_SHOW_USD=$(jq -r 'if .currency.show_usd == true then "1" else empty end' "$PET_CONFIG_EARLY" 2>/dev/null)
-  COST_SYMBOL=$(jq -r '.currency.symbol // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
+# One read for the whole file: this used to be four jq calls, and the background
+# FX updater can rewrite config.json mid-render — a single read is also a
+# consistent snapshot. The display toggle comes from the same read.
+CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""
+if [[ -f "$PET_CONFIG" ]]; then
+  IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL \
+    <<< "$(jq -r '[
+      (if .display == false then "false" else "true" end),
+      (.currency.code // ""),
+      (.currency.usd_rate // ""),
+      (if .currency.show_usd == true then "1" else "" end),
+      (.currency.symbol // "")
+    ] | map(tostring) | join("\u001f")' "$PET_CONFIG" 2>/dev/null)"
 fi
+PET_DISPLAY="${CFG_DISPLAY:-true}"
+COST_CURRENCY="${PET_COST_CURRENCY:-$CFG_CODE}"
+USD_RATE="${PET_USD_RATE:-$CFG_RATE}"
+COST_SHOW_USD="${PET_COST_SHOW_USD:-$CFG_SHOW_USD}"
+COST_SYMBOL="$CFG_SYMBOL"
 COST_CURRENCY="${COST_CURRENCY:-USD}"
 USD_RATE="${USD_RATE:-1}"
 COST_SHOW_USD="${COST_SHOW_USD:-0}"
@@ -245,12 +304,12 @@ PLAN=""
 [[ -z "$PCT" ]] && PCT=0
 BAR_W=10
 FILLED=$((PCT * BAR_W / 100))
-[[ "$FILLED" -gt "$BAR_W" ]] && FILLED=$BAR_W
+(( FILLED > BAR_W )) && FILLED=$BAR_W
 EMPTY=$((BAR_W - FILLED))
-BAR=""
-[[ "$FILLED" -gt 0 ]] && BAR=$(printf "%${FILLED}s" | tr ' ' '#')
-[[ "$EMPTY"  -gt 0 ]] && BAR="${BAR}$(printf "%${EMPTY}s" | tr ' ' '-')"
-BAR="[${BAR}]"
+# printf -v + parameter expansion: no fork per segment (was two `tr` pipelines)
+printf -v BAR '%*s' "$FILLED" ''
+printf -v BAR_PAD '%*s' "$EMPTY" ''
+BAR="[${BAR// /#}${BAR_PAD// /-}]"
 USED_FMT=$(fmt_tokens "$CTX_USED")
 SIZE_FMT=$(fmt_tokens "$CTX_SIZE")
 CTX_NUM="${USED_FMT}/${SIZE_FMT}"
@@ -258,11 +317,11 @@ CACHE_FMT=$(fmt_tokens "$CACHE_READ")
 OUT_FMT=$(fmt_tokens "$OUT_TOK")
 # Cache hit rate = cache_read / (input + cache_write + cache_read)
 # Show % first (intuition), then volume (scale):  cache 99% · 207k
-CACHE_DENOM=$(awk -v a="${USAGE_IN:-0}" -v b="${USAGE_CC:-0}" -v c="${USAGE_CR:-0}" 'BEGIN{printf "%d", a+b+c}')
+CACHE_DENOM=$(( ${USAGE_IN:-0} + ${USAGE_CC:-0} + ${USAGE_CR:-0} ))
 CACHE_SEG=""
-if [[ "${CACHE_DENOM:-0}" -gt 0 ]] 2>/dev/null; then
-  CACHE_HIT=$(awk -v r="${USAGE_CR:-0}" -v d="$CACHE_DENOM" 'BEGIN{printf "%d", (r*100)/d}')
-  [[ "$CACHE_HIT" -gt 100 ]] && CACHE_HIT=100
+if (( CACHE_DENOM > 0 )); then
+  CACHE_HIT=$(( ${USAGE_CR:-0} * 100 / CACHE_DENOM ))
+  (( CACHE_HIT > 100 )) && CACHE_HIT=100
   if [[ "${USAGE_CR:-0}" != "0" ]]; then
     CACHE_SEG="cache ${CACHE_HIT}% · ${CACHE_FMT}"
   else
@@ -279,7 +338,7 @@ SEP="${DIM} │ ${RST}"
 
 # ── Assemble status bar ──────────────────────────────────────────────────────
 # Example:
-#   ⬡ model │ ~/path │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
+#   ⬡ model │ claudePet │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
 L=""
 [[ -n "$PLAN" ]] && L="${GRAY}${PLAN}${RST}${SEP}"
 L="${L}${GRAY}⬡ ${MODEL}${RST}"
@@ -295,50 +354,49 @@ if [[ "${LINES_ADD:-0}" != "0" ]] || [[ "${LINES_DEL:-0}" != "0" ]]; then
 fi
 
 # ── Pet Buddy (monstapix block art) ──────────────────────────────────────────
-PET_DIR="$HOME/.claude/claude-pet"
+# PET_DISPLAY came from the config read above
 PET_STATE="$PET_DIR/state.json"
 PET_SPRITES="$PET_DIR/sprites.json"
-PET_CONFIG="$PET_DIR/config.json"
 PET_ACTIVITY="$PET_DIR/last-activity.json"
-PET_DISPLAY=$(jq -r 'if .display == false then "false" else "true" end' "$PET_CONFIG" 2>/dev/null)
+PET_CREATURES="$PET_DIR/creatures.json"
 
 if [[ "$PET_DISPLAY" = "true" ]] && [[ -f "$PET_STATE" ]] && [[ -f "$PET_SPRITES" ]] && command -v jq &>/dev/null; then
-  PET_STAGE_IDX=$(jq -r '.currentStageIndex // 0' "$PET_STATE")
-  PET_LINE_ID=$(jq -r '.currentLineId // "titan"' "$PET_STATE")
-  PET_XP=$(jq -r '.xp // 0' "$PET_STATE")
+  IFS=$'\x1f' read -r PET_STAGE_IDX PET_LINE_ID PET_XP \
+    <<< "$(jq -r '[
+      (.currentStageIndex // 0), (.currentLineId // "titan"), (.xp // 0)
+    ] | map(tostring) | join("\u001f")' "$PET_STATE" 2>/dev/null)"
 
-  # Read XP thresholds from creatures.json (family-aware)
-  PET_CREATURES="$PET_DIR/creatures.json"
-  NEXT_IDX=$((PET_STAGE_IDX + 1))
-  TOTAL_STAGES=$(jq -r ".evolutionLines.\"${PET_LINE_ID}\".stages | length" "$PET_CREATURES" 2>/dev/null)
-  if [[ -n "$TOTAL_STAGES" ]] && [[ "$NEXT_IDX" -lt "$TOTAL_STAGES" ]]; then
-    PET_XP_NEXT=$(jq -r ".evolutionLines.\"${PET_LINE_ID}\".stages[$NEXT_IDX].xpRequired" "$PET_CREATURES")
-  else
-    PET_XP_NEXT="MAX"
-  fi
-
-  PET_NAME=$(jq -r ".evolutionLines.\"${PET_LINE_ID}\".stages[$PET_STAGE_IDX].name" "$PET_CREATURES" 2>/dev/null)
+  # Name and next threshold in one pass over creatures.json, family-aware.
+  # An unknown family (hand-edited state.json) falls back to the first line.
+  # keys[0] must be evaluated against .evolutionLines, not the root — inside the
+  # pipeline `.` is evolutionLines, so it picks a real family id.
+  IFS=$'\x1f' read -r PET_XP_NEXT PET_NAME \
+    <<< "$(jq -r --arg line "${PET_LINE_ID:-titan}" --argjson idx "${PET_STAGE_IDX:-0}" '
+      (.evolutionLines | (.[$line] // .[keys[0]]) | .stages) as $s
+      | ($s[$idx] // $s[0]) as $cur
+      | [
+          (if $idx + 1 < ($s | length) then $s[$idx + 1].xpRequired else "MAX" end),
+          ($cur.name // "???")
+        ] | map(tostring) | join("\u001f")' "$PET_CREATURES" 2>/dev/null)"
 
   # Read last activity message (within 10 min)
   PET_MSG=""
   if [[ -f "$PET_ACTIVITY" ]]; then
-    ACT_TS=$(jq -r '.timestamp // 0' "$PET_ACTIVITY")
-    ACT_MSG=$(jq -r '.message // ""' "$PET_ACTIVITY")
-    NOW_S=$(date +%s)
-    ACT_S=$((ACT_TS / 1000))
-    AGE=$((NOW_S - ACT_S))
-    if [[ "$AGE" -lt 600 ]] 2>/dev/null; then
-      PET_MSG="$ACT_MSG"
-    fi
+    IFS=$'\x1f' read -r ACT_TS ACT_MSG \
+      <<< "$(jq -r '[(.timestamp // 0), (.message // "")] | map(tostring) | join("\u001f")' "$PET_ACTIVITY" 2>/dev/null)"
+    ACT_S=$(( ${ACT_TS:-0} / 1000 ))
+    AGE=$(( $(date +%s) - ACT_S ))
+    (( AGE < 600 )) && PET_MSG="$ACT_MSG"
   fi
 
   # Read sprite lines and print with message on first, info on last
-  if [[ -f "$PET_SPRITES" ]]; then
-    SPRITE_LINES=()
-    while IFS= read -r line; do
-      SPRITE_LINES+=("$line")
-    done < <(jq -r ".\"${PET_LINE_ID}\".\"${PET_STAGE_IDX}\"[]" "$PET_SPRITES" 2>/dev/null)
+  SPRITE_LINES=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    SPRITE_LINES+=("$line")
+  done < <(jq -r --arg line "${PET_LINE_ID:-titan}" --arg idx "${PET_STAGE_IDX:-0}" \
+    '((.[$line] // .[keys[0]])[$idx] // [])[]' "$PET_SPRITES" 2>/dev/null)
 
+  if (( ${#SPRITE_LINES[@]} > 0 )); then
     SPRITE_W=0
     for sl in "${SPRITE_LINES[@]}"; do
       [[ ${#sl} -gt "$SPRITE_W" ]] && SPRITE_W=${#sl}
@@ -357,6 +415,8 @@ if [[ "$PET_DISPLAY" = "true" ]] && [[ -f "$PET_STATE" ]] && [[ -f "$PET_SPRITES
       fi
     done
   fi
-
-  printf "%b\n" "$L"
 fi
+
+# Always print the metrics bar: /pet off hides the creature, not the status line,
+# and a missing state/sprites file must not blank it either.
+printf "%b\n" "$L"

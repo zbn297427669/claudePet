@@ -1,4 +1,11 @@
-import type { PetState, CreatureStage, PromptScore, Milestone } from "../types.js";
+import type {
+  PetState,
+  CreatureStage,
+  CreatureRegistry,
+  EvolutionLine,
+  PromptScore,
+  Milestone,
+} from "../types.js";
 
 interface EvolutionResult {
   evolved: boolean;
@@ -37,13 +44,33 @@ export function checkEvolution(
   return { evolved: false, newStageIndex: state.currentStageIndex };
 }
 
+/** The pet's evolution line, repairing a currentLineId the registry doesn't know. */
+export function resolveLine(
+  registry: CreatureRegistry,
+  state: PetState
+): EvolutionLine {
+  const line = registry.evolutionLines[state.currentLineId];
+  if (line) return line;
+  const fallbackId = Object.keys(registry.evolutionLines)[0];
+  state.currentLineId = fallbackId;
+  return registry.evolutionLines[fallbackId];
+}
+
+/** XP required by the stage after `index`, or -1 once the pet is fully evolved. */
+export function nextStageXp(stages: CreatureStage[], index: number): number {
+  return index + 1 < stages.length ? stages[index + 1].xpRequired : -1;
+}
+
+/**
+ * Add XP and roll the daily streak. This does not count a scored prompt —
+ * commits and test runs go through here too.
+ */
 export function awardXp(
   state: PetState,
   xp: number,
   today?: string
 ): void {
   state.xp += xp;
-  state.totalPromptsScored += 1;
 
   const dateStr = today ?? new Date().toISOString().split("T")[0];
 
@@ -63,6 +90,16 @@ export function awardXp(
   }
 
   state.lastActiveDate = dateStr;
+}
+
+/** Award XP for one scored prompt — the only place totalPromptsScored moves. */
+export function awardPromptXp(
+  state: PetState,
+  xp: number,
+  today?: string
+): void {
+  state.totalPromptsScored += 1;
+  awardXp(state, xp, today);
 }
 
 export function checkMilestones(

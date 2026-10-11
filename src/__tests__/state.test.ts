@@ -1,4 +1,11 @@
-import { mkdtempSync, rmSync, readFileSync } from "fs";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  utimesSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { StateManager } from "../engine/state.js";
@@ -55,6 +62,55 @@ describe("StateManager", () => {
         readFileSync(join(tempDir, "state.json"), "utf-8")
       );
       expect(raw.xp).toBe(100);
+    });
+  });
+
+  describe("update", () => {
+    it("should persist what the mutator changed and return its value", () => {
+      const result = manager.update((state) => {
+        state.xp += 25;
+        return "done";
+      });
+      expect(result).toBe("done");
+      expect(manager.loadState().xp).toBe(25);
+    });
+
+    it("should let a nested update run without deadlocking", () => {
+      manager.update((state) => {
+        state.xp = 5;
+        manager.update((inner) => {
+          inner.xp += 1;
+        });
+      });
+      expect(manager.loadState().xp).toBe(6);
+    });
+
+    it("should break a lock left behind by a dead process", () => {
+      const lockFile = join(tempDir, ".lock");
+      writeFileSync(lockFile, "999999\n");
+      const longAgo = new Date(Date.now() - 60_000);
+      utimesSync(lockFile, longAgo, longAgo);
+
+      manager.update((state) => {
+        state.xp = 7;
+      });
+
+      expect(manager.loadState().xp).toBe(7);
+      expect(existsSync(lockFile)).toBe(false);
+    });
+  });
+
+  describe("forward compatibility", () => {
+    it("should fill in fields an older state file lacks", () => {
+      writeFileSync(
+        join(tempDir, "state.json"),
+        JSON.stringify({ currentLineId: "swarm", xp: 300 })
+      );
+      const state = manager.loadState();
+      expect(state.xp).toBe(300);
+      expect(state.currentLineId).toBe("swarm");
+      expect(state.evolutionHistory).toEqual([]);
+      expect(state.totalPromptsScored).toBe(0);
     });
   });
 

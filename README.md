@@ -107,6 +107,8 @@ Remove the `UserPromptSubmit` hook and `statusLine` entries from `~/.claude/sett
 | `log_activity` | Bonus XP for commits, tests, PRs |
 | `get_evolution_history` | View evolution timeline |
 
+The `UserPromptSubmit` hook already scores every prompt you send, so `analyze_prompt` will not award XP a second time for the same prompt within a minute — it just re-shows the score. `log_activity` awards XP but is deliberately not counted as a scored prompt, so commits and test runs never inflate the 100-prompts milestone.
+
 </details>
 
 
@@ -164,8 +166,20 @@ Pet state persists in `~/.claude/claude-pet/`:
 - `creatures.json` — creature registry
 - `config.json` — display toggle and optional `currency` settings
 - `prompt-history.json` — last 50 scored prompts
+- `last-error.log` — written only if the hook hits an error, so it fails quietly in your prompt flow but still leaves a trace
 
 </details>
+
+## Development
+
+```bash
+npm test              # unit tests (jest) + status line smoke tests (bash)
+npm run test:unit     # jest only
+npm run test:scripts  # status line only — no jest, runs against a temp $HOME
+npm run build         # tsc + copy data/ into dist/
+```
+
+CI runs typecheck, unit tests, build, `bash -n` on every shell script, and the status line smoke test on Node 20 and 22, alongside the Semgrep scan.
 
 ## Credits
 

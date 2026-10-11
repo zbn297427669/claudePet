@@ -64,6 +64,41 @@ describe("MCP tools", () => {
         expect(result.display).toContain("EVOLUTION");
       }
     });
+
+    it("should not score the same prompt twice inside the window", () => {
+      const now = Date.now();
+      const first = handleAnalyzePrompt("fix the bug in src/auth.ts:42", stateManager, registry, now);
+      const second = handleAnalyzePrompt("fix the bug in src/auth.ts:42", stateManager, registry, now + 1_000);
+
+      expect(first.duplicate).toBe(false);
+      expect(second.duplicate).toBe(true);
+      expect(second.xpAwarded).toBe(0);
+      expect(stateManager.loadState().totalPromptsScored).toBe(1);
+    });
+
+    it("should score the same prompt again once the window passes", () => {
+      const now = Date.now();
+      handleAnalyzePrompt("fix the bug in src/auth.ts:42", stateManager, registry, now);
+      const later = handleAnalyzePrompt(
+        "fix the bug in src/auth.ts:42",
+        stateManager,
+        registry,
+        now + 61_000
+      );
+      expect(later.duplicate).toBe(false);
+      expect(stateManager.loadState().totalPromptsScored).toBe(2);
+    });
+
+    it("should repair an unknown family instead of crashing", () => {
+      const state = stateManager.loadState();
+      state.currentLineId = "default";
+      stateManager.saveState(state);
+
+      expect(() => handleAnalyzePrompt("hello", stateManager, registry)).not.toThrow();
+      expect(Object.keys(registry.evolutionLines)).toContain(
+        stateManager.loadState().currentLineId
+      );
+    });
   });
 
   describe("get-pet-status", () => {
@@ -91,6 +126,15 @@ describe("MCP tools", () => {
     it("should award XP for pr_merged", () => {
       const result = handleLogActivity("pr_merged", "#42", stateManager, registry);
       expect(result.xpAwarded).toBe(15);
+    });
+
+    it("should not count an activity as a scored prompt", () => {
+      handleLogActivity("pr_merged", "#42", stateManager, registry);
+      handleLogActivity("git_commit", "abc123", stateManager, registry);
+      const state = stateManager.loadState();
+      expect(state.xp).toBe(20);
+      // totalPromptsScored drives the 100_prompts milestone — commits must not inflate it
+      expect(state.totalPromptsScored).toBe(0);
     });
   });
 

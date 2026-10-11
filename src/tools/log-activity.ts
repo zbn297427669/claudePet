@@ -1,5 +1,5 @@
 import { StateManager } from "../engine/state.js";
-import { awardXp, checkEvolution } from "../engine/evolution.js";
+import { awardXp, checkEvolution, nextStageXp, resolveLine } from "../engine/evolution.js";
 import { renderPet, renderEvolution } from "../engine/renderer.js";
 import { writeLastActivity } from "../engine/activity.js";
 import type { CreatureRegistry } from "../types.js";
@@ -23,44 +23,38 @@ export function handleLogActivity(
   registry: CreatureRegistry
 ): LogActivityResult {
   const xp = ACTIVITY_XP[type] ?? 0;
-  const state = stateManager.loadState();
-  awardXp(state, xp);
 
-  const line = registry.evolutionLines[state.currentLineId];
-  const stages = line.stages;
-  const evoResult = checkEvolution(state, stages);
+  return stateManager.update((state) => {
+    // A commit is not a scored prompt: awardXp leaves totalPromptsScored alone
+    awardXp(state, xp);
 
-  if (evoResult.evolved) {
-    const oldName = stages[state.currentStageIndex].name;
-    state.currentStageIndex = evoResult.newStageIndex;
-    state.evolutionHistory.push({
-      stageId: stages[evoResult.newStageIndex].id,
-      reachedAt: new Date().toISOString().split("T")[0],
-    });
-    stateManager.saveState(state);
+    const stages = resolveLine(registry, state).stages;
+    const evo = checkEvolution(state, stages);
 
-    const newStage = stages[evoResult.newStageIndex];
-    const xpNext = evoResult.newStageIndex + 1 < stages.length
-      ? stages[evoResult.newStageIndex + 1].xpRequired
-      : -1;
+    let display: string;
+    let message: string;
+    if (evo.evolved) {
+      const oldName = stages[state.currentStageIndex].name;
+      state.currentStageIndex = evo.newStageIndex;
+      state.evolutionHistory.push({
+        stageId: stages[evo.newStageIndex].id,
+        reachedAt: new Date().toISOString().split("T")[0],
+      });
+      const newStage = stages[evo.newStageIndex];
+      display = renderEvolution(oldName, newStage, state.xp, nextStageXp(stages, evo.newStageIndex));
+      message = `${newStage.name} has awakened!`;
+    } else {
+      message = `+${xp} XP for ${type.replace("_", " ")}!`;
+      display = renderPet(
+        stages[state.currentStageIndex],
+        state.xp,
+        nextStageXp(stages, state.currentStageIndex),
+        message,
+        []
+      );
+    }
 
-    return {
-      xpAwarded: xp,
-      display: renderEvolution(oldName, newStage, state.xp, xpNext),
-      evolved: true,
-    };
-  }
-
-  stateManager.saveState(state);
-
-  const currentStage = stages[state.currentStageIndex];
-  const xpNext = state.currentStageIndex + 1 < stages.length
-    ? stages[state.currentStageIndex + 1].xpRequired
-    : state.xp;
-
-  const speech = `+${xp} XP for ${type.replace("_", " ")}!`;
-  const display = renderPet(currentStage, state.xp, xpNext, speech, []);
-
-  writeLastActivity(stateManager, xp, speech);
-  return { xpAwarded: xp, display, evolved: false };
+    writeLastActivity(stateManager, xp, message);
+    return { xpAwarded: xp, display, evolved: evo.evolved };
+  });
 }

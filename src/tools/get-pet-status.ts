@@ -1,4 +1,5 @@
 import { StateManager } from "../engine/state.js";
+import { nextStageXp, resolveLine } from "../engine/evolution.js";
 import type { CreatureRegistry } from "../types.js";
 
 interface PetStatusResult {
@@ -16,11 +17,9 @@ export function handleGetPetStatus(
   registry: CreatureRegistry
 ): PetStatusResult {
   const state = stateManager.loadState();
-  const line = registry.evolutionLines[state.currentLineId];
-  const stage = line.stages[state.currentStageIndex];
-  const xpNext = state.currentStageIndex + 1 < line.stages.length
-    ? line.stages[state.currentStageIndex + 1].xpRequired
-    : -1;
+  const stages = resolveLine(registry, state).stages;
+  const stage = stages[state.currentStageIndex];
+  const xpNext = nextStageXp(stages, state.currentStageIndex);
 
   return {
     name: stage.name,

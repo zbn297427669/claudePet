@@ -8,6 +8,38 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the documented minimum; 22 is what the jest ESM setup runs on locally
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install
+        run: npm ci --ignore-scripts
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Build
+        run: npm run build
+      - name: Shell syntax check
+        run: |
+          for f in scripts/*.sh install.sh; do
+            echo "bash -n $f"
+            bash -n "$f" || exit 1
+          done
+      - name: Status line smoke test
+        run: npm run test:scripts
+
   # Community Edition：不需要 SEMGREP_APP_TOKEN。p/default 是精选规则。
   # 全级别结果打在日志里；只有 ERROR 让检查失败。--metrics=off 避免把代码片段送去 Semgrep。
   semgrep:

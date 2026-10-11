@@ -52,6 +52,9 @@ export interface PetState {
     stageId: string;
     reachedAt: string;
   }>;
+  /** Hash of the last scored prompt — stops the hook and the MCP tool double-counting it. */
+  lastScoredHash?: string;
+  lastScoredAt?: number;
 }
 
 export interface PromptHistoryEntry {

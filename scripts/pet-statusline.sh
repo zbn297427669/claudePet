@@ -176,12 +176,13 @@ fmt_tokens() {
     else if (n>=1000) printf "%.1fk", n/1000
     else printf "%d", n
   }'
+  return 0
 }
 
 # ── Dir: shorten to ~/parent/dir ─────────────────────────────────────────────
 DIR="${DIR/#$HOME/~}"
 NSEGS=$(echo "$DIR" | tr -cd '/' | wc -c | tr -d ' ')
-if [ "$NSEGS" -gt 2 ]; then
+if [[ "$NSEGS" -gt 2 ]]; then
   PARENT=$(echo "$DIR" | awk -F/ '{print $(NF-1)}')
   LEAF=$(echo "$DIR"   | awk -F/ '{print $NF}')
   DIR_DISPLAY="~/${PARENT}/${LEAF}"
@@ -202,10 +203,10 @@ COST_CURRENCY="${PET_COST_CURRENCY:-}"
 USD_RATE="${PET_USD_RATE:-}"
 COST_SHOW_USD="${PET_COST_SHOW_USD:-}"
 COST_SYMBOL=""
-if [ -f "$PET_CONFIG_EARLY" ]; then
-  [ -z "$COST_CURRENCY" ] && COST_CURRENCY=$(jq -r '.currency.code // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
-  [ -z "$USD_RATE" ] && USD_RATE=$(jq -r '.currency.usd_rate // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
-  [ -z "$COST_SHOW_USD" ] && COST_SHOW_USD=$(jq -r 'if .currency.show_usd == true then "1" else empty end' "$PET_CONFIG_EARLY" 2>/dev/null)
+if [[ -f "$PET_CONFIG_EARLY" ]]; then
+  [[ -z "$COST_CURRENCY" ]] && COST_CURRENCY=$(jq -r '.currency.code // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
+  [[ -z "$USD_RATE" ]] && USD_RATE=$(jq -r '.currency.usd_rate // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
+  [[ -z "$COST_SHOW_USD" ]] && COST_SHOW_USD=$(jq -r 'if .currency.show_usd == true then "1" else empty end' "$PET_CONFIG_EARLY" 2>/dev/null)
   COST_SYMBOL=$(jq -r '.currency.symbol // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
 fi
 COST_CURRENCY="${COST_CURRENCY:-USD}"
@@ -216,20 +217,20 @@ case "$COST_CURRENCY" in
   USD|usd|"") COST_SYMBOL="${COST_SYMBOL:-\$}"; COST_CURRENCY="USD"; USD_RATE=1 ;;
   *) COST_SYMBOL="${COST_SYMBOL:-$COST_CURRENCY }" ;;
 esac
-if [ "$COST_CURRENCY" = "USD" ] || [ "$USD_RATE" = "1" ] || [ -z "$USD_RATE" ]; then
+if [[ "$COST_CURRENCY" = "USD" ]] || [[ "$USD_RATE" = "1" ]] || [[ -z "$USD_RATE" ]]; then
   COST_FMT=$(printf '%s%.4f' "$COST_SYMBOL" "$COST")
 else
   COST_LOCAL=$(awk -v c="$COST" -v r="$USD_RATE" 'BEGIN{printf "%.4f", c*r}')
-  if [ "$COST_SHOW_USD" = "1" ]; then
+  if [[ "$COST_SHOW_USD" = "1" ]]; then
     COST_FMT=$(printf '%s%s (~$%.4f)' "$COST_SYMBOL" "$COST_LOCAL" "$COST")
   else
     COST_FMT=$(printf '%s%s' "$COST_SYMBOL" "$COST_LOCAL")
   fi
 fi
 DUR_S=$(( ${DUR_MS:-0} / 1000 ))
-if [ "$DUR_S" -ge 3600 ]; then
+if [[ "$DUR_S" -ge 3600 ]]; then
   DUR_FMT=$(printf '%dh%02dm' $((DUR_S/3600)) $(((DUR_S%3600)/60)))
-elif [ "$DUR_S" -ge 60 ]; then
+elif [[ "$DUR_S" -ge 60 ]]; then
   DUR_FMT=$(printf '%dm%02ds' $((DUR_S/60)) $((DUR_S%60)))
 else
   DUR_FMT="${DUR_S}s"
@@ -241,14 +242,14 @@ PLAN=""
 
 # ── Context bar (10 chars) + numeric usage ───────────────────────────────────
 # ASCII #/- so terminals missing shade glyphs (▓/░) don't show �.
-[ -z "$PCT" ] && PCT=0
+[[ -z "$PCT" ]] && PCT=0
 BAR_W=10
 FILLED=$((PCT * BAR_W / 100))
-[ "$FILLED" -gt "$BAR_W" ] && FILLED=$BAR_W
+[[ "$FILLED" -gt "$BAR_W" ]] && FILLED=$BAR_W
 EMPTY=$((BAR_W - FILLED))
 BAR=""
-[ "$FILLED" -gt 0 ] && BAR=$(printf "%${FILLED}s" | tr ' ' '#')
-[ "$EMPTY"  -gt 0 ] && BAR="${BAR}$(printf "%${EMPTY}s" | tr ' ' '-')"
+[[ "$FILLED" -gt 0 ]] && BAR=$(printf "%${FILLED}s" | tr ' ' '#')
+[[ "$EMPTY"  -gt 0 ]] && BAR="${BAR}$(printf "%${EMPTY}s" | tr ' ' '-')"
 BAR="[${BAR}]"
 USED_FMT=$(fmt_tokens "$CTX_USED")
 SIZE_FMT=$(fmt_tokens "$CTX_SIZE")
@@ -259,10 +260,10 @@ OUT_FMT=$(fmt_tokens "$OUT_TOK")
 # Show % first (intuition), then volume (scale):  cache 99% · 207k
 CACHE_DENOM=$(awk -v a="${USAGE_IN:-0}" -v b="${USAGE_CC:-0}" -v c="${USAGE_CR:-0}" 'BEGIN{printf "%d", a+b+c}')
 CACHE_SEG=""
-if [ "${CACHE_DENOM:-0}" -gt 0 ] 2>/dev/null; then
+if [[ "${CACHE_DENOM:-0}" -gt 0 ]] 2>/dev/null; then
   CACHE_HIT=$(awk -v r="${USAGE_CR:-0}" -v d="$CACHE_DENOM" 'BEGIN{printf "%d", (r*100)/d}')
-  [ "$CACHE_HIT" -gt 100 ] && CACHE_HIT=100
-  if [ "${USAGE_CR:-0}" != "0" ]; then
+  [[ "$CACHE_HIT" -gt 100 ]] && CACHE_HIT=100
+  if [[ "${USAGE_CR:-0}" != "0" ]]; then
     CACHE_SEG="cache ${CACHE_HIT}% · ${CACHE_FMT}"
   else
     CACHE_SEG="cache 0%"
@@ -280,16 +281,16 @@ SEP="${DIM} │ ${RST}"
 # Example:
 #   ⬡ model │ ~/path │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
 L=""
-[ -n "$PLAN" ] && L="${GRAY}${PLAN}${RST}${SEP}"
+[[ -n "$PLAN" ]] && L="${GRAY}${PLAN}${RST}${SEP}"
 L="${L}${GRAY}⬡ ${MODEL}${RST}"
 L="${L}${SEP}${GRAY}${DIR_DISPLAY}${RST}"
-[ -n "$BRANCH" ] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}"
+[[ -n "$BRANCH" ]] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}"
 L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}% ${CTX_NUM}${RST}"
-[ -n "$CACHE_SEG" ] && L="${L}${SEP}${GRAY}${CACHE_SEG}${RST}"
-[ "${OUT_TOK:-0}" != "0" ] && L="${L}${SEP}${GRAY}out ${OUT_FMT}${RST}"
+[[ -n "$CACHE_SEG" ]] && L="${L}${SEP}${GRAY}${CACHE_SEG}${RST}"
+[[ "${OUT_TOK:-0}" != "0" ]] && L="${L}${SEP}${GRAY}out ${OUT_FMT}${RST}"
 L="${L}${SEP}${GRAY}${COST_FMT}${RST}"
-[ "${DUR_MS:-0}" != "0" ] && L="${L}${SEP}${GRAY}${DUR_FMT}${RST}"
-if [ "${LINES_ADD:-0}" != "0" ] || [ "${LINES_DEL:-0}" != "0" ]; then
+[[ "${DUR_MS:-0}" != "0" ]] && L="${L}${SEP}${GRAY}${DUR_FMT}${RST}"
+if [[ "${LINES_ADD:-0}" != "0" ]] || [[ "${LINES_DEL:-0}" != "0" ]]; then
   L="${L}${SEP}${GRAY}${LINES_FMT}${RST}"
 fi
 
@@ -301,7 +302,7 @@ PET_CONFIG="$PET_DIR/config.json"
 PET_ACTIVITY="$PET_DIR/last-activity.json"
 PET_DISPLAY=$(jq -r 'if .display == false then "false" else "true" end' "$PET_CONFIG" 2>/dev/null)
 
-if [ "$PET_DISPLAY" = "true" ] && [ -f "$PET_STATE" ] && [ -f "$PET_SPRITES" ] && command -v jq &>/dev/null; then
+if [[ "$PET_DISPLAY" = "true" ]] && [[ -f "$PET_STATE" ]] && [[ -f "$PET_SPRITES" ]] && command -v jq &>/dev/null; then
   PET_STAGE_IDX=$(jq -r '.currentStageIndex // 0' "$PET_STATE")
   PET_LINE_ID=$(jq -r '.currentLineId // "titan"' "$PET_STATE")
   PET_XP=$(jq -r '.xp // 0' "$PET_STATE")
@@ -310,7 +311,7 @@ if [ "$PET_DISPLAY" = "true" ] && [ -f "$PET_STATE" ] && [ -f "$PET_SPRITES" ] &
   PET_CREATURES="$PET_DIR/creatures.json"
   NEXT_IDX=$((PET_STAGE_IDX + 1))
   TOTAL_STAGES=$(jq -r ".evolutionLines.\"${PET_LINE_ID}\".stages | length" "$PET_CREATURES" 2>/dev/null)
-  if [ -n "$TOTAL_STAGES" ] && [ "$NEXT_IDX" -lt "$TOTAL_STAGES" ]; then
+  if [[ -n "$TOTAL_STAGES" ]] && [[ "$NEXT_IDX" -lt "$TOTAL_STAGES" ]]; then
     PET_XP_NEXT=$(jq -r ".evolutionLines.\"${PET_LINE_ID}\".stages[$NEXT_IDX].xpRequired" "$PET_CREATURES")
   else
     PET_XP_NEXT="MAX"
@@ -320,19 +321,19 @@ if [ "$PET_DISPLAY" = "true" ] && [ -f "$PET_STATE" ] && [ -f "$PET_SPRITES" ] &
 
   # Read last activity message (within 10 min)
   PET_MSG=""
-  if [ -f "$PET_ACTIVITY" ]; then
+  if [[ -f "$PET_ACTIVITY" ]]; then
     ACT_TS=$(jq -r '.timestamp // 0' "$PET_ACTIVITY")
     ACT_MSG=$(jq -r '.message // ""' "$PET_ACTIVITY")
     NOW_S=$(date +%s)
     ACT_S=$((ACT_TS / 1000))
     AGE=$((NOW_S - ACT_S))
-    if [ "$AGE" -lt 600 ] 2>/dev/null; then
+    if [[ "$AGE" -lt 600 ]] 2>/dev/null; then
       PET_MSG="$ACT_MSG"
     fi
   fi
 
   # Read sprite lines and print with message on first, info on last
-  if [ -f "$PET_SPRITES" ]; then
+  if [[ -f "$PET_SPRITES" ]]; then
     SPRITE_LINES=()
     while IFS= read -r line; do
       SPRITE_LINES+=("$line")
@@ -340,16 +341,16 @@ if [ "$PET_DISPLAY" = "true" ] && [ -f "$PET_STATE" ] && [ -f "$PET_SPRITES" ] &
 
     SPRITE_W=0
     for sl in "${SPRITE_LINES[@]}"; do
-      [ ${#sl} -gt "$SPRITE_W" ] && SPRITE_W=${#sl}
+      [[ ${#sl} -gt "$SPRITE_W" ]] && SPRITE_W=${#sl}
     done
     SPRITE_W=$((SPRITE_W + 1))
 
     LAST_IDX=$(( ${#SPRITE_LINES[@]} - 1 ))
     for (( i=0; i<${#SPRITE_LINES[@]}; i++ )); do
       PADDED=$(printf "%-${SPRITE_W}s" "${SPRITE_LINES[$i]}")
-      if [ "$i" -eq 0 ] && [ -n "$PET_MSG" ]; then
+      if [[ "$i" -eq 0 ]] && [[ -n "$PET_MSG" ]]; then
         printf "%b\n" "${GRAY}${PADDED} ${PET_MSG}${RST}"
-      elif [ "$i" -eq "$LAST_IDX" ]; then
+      elif [[ "$i" -eq "$LAST_IDX" ]]; then
         printf "%b\n" "${GRAY}${PADDED} Pet: ◆ ${PET_NAME:-???}  ♥ ${PET_XP}/${PET_XP_NEXT} XP${RST}"
       else
         printf "%b\n" "${GRAY}${PADDED}${RST}"

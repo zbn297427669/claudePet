@@ -29,8 +29,8 @@ check() { # label, actual, expected
 # ── fixtures ─────────────────────────────────────────────────────────────────
 cat > "$FIX/catalog.json" <<'JSON'
 { "data": [
-  { "id": "z-ai/glm-5.3-flash", "pricing": { "prompt": 0.00000015, "completion": 0.0000005, "input_cache_read": 0.00000003 } },
-  { "id": "~deepseek/deepseek-flash-latest", "pricing": { "prompt": 0.0000000348, "completion": 0.0000001392, "input_cache_read": 0.000000000696 } }
+  { "id": "z-ai/glm-5.3-flash", "context_length": 131072, "pricing": { "prompt": 0.00000015, "completion": 0.0000005, "input_cache_read": 0.00000003 } },
+  { "id": "~deepseek/deepseek-flash-latest", "context_length": 1048576, "pricing": { "prompt": 0.0000000348, "completion": 0.0000001392, "input_cache_read": 0.000000000696 } }
 ] }
 JSON
 
@@ -53,7 +53,7 @@ def money(v: float) -> str:
 rows = [("1M INPUT TOKENS<br>(CACHE HIT)", hit),
         ("1M INPUT TOKENS<br>(CACHE MISS)", miss),
         ("1M OUTPUT TOKENS", gen)]
-body = []
+body = ['<tr><td colspan="3">CONTEXT LENGTH</td><td colspan="2">1M</td></tr>']
 for i, (label, off) in enumerate(rows):
     lead = '<td rowspan="6">PRICING<sup>(2)</sup></td>' if i == 0 else ""
     body.append(f'<tr>{lead}<td rowspan="2">{label}</td><td>OFF-PEAK</td>'
@@ -124,6 +124,8 @@ check "openrouter price kept for audit" "$(q "$CFG" '.pricing.models["deepseek-f
 check "flat model still priced by openrouter" "$(q "$CFG" '.pricing.models["glm-5.3-flash"].source')" "openrouter"
 check "writes the peak windows"        "$(q "$CFG" '.pricing.peak_windows | length')" "2"
 check "writes the peak days"           "$(q "$CFG" '.pricing.peak_days | length')" "5"
+check "context length from the page"   "$(q "$CFG" '.pricing.models["deepseek-flash"].context_tokens')" "1000000"
+check "context length from the catalog" "$(q "$CFG" '.pricing.models["glm-5.3-flash"].context_tokens')" "131072"
 check "parses holiday off-days"        "$(q "$CFG" '.pricing.off_peak_dates | length')" "2"
 check "keeps the user's tier_mode"     "$(q "$CFG" '.pricing.tier_mode')" "off_peak"
 check "never overwrites a user pin"    "$(q "$CFG" '.pricing.models["hand-pinned"].input_per_mtok')" "1"

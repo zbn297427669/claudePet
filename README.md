@@ -145,6 +145,10 @@ If your gateway does **not** follow DeepSeek's schedule, override it — either 
         "peak":     { "input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006 } } } } }
 ```
 
+### Context window size
+
+Claude Code reports `context_window_size` as **200000** for any model it does not recognise as extended-context, which understates a gateway model — DeepSeek Flash is 1M. So the bar prefers the limit recorded on the model's entry: the `CONTEXT LENGTH` row of the DeepSeek page, or OpenRouter's `context_length` for other models. It wins only when it is **larger** than the payload's value, and when it wins the percentage is recomputed with the same input-only formula Claude Code documents (`input + cache_creation + cache_read`), so the bar, the percentage and the `used/size` numbers agree. Set `"context_window_tokens": 1000000` in `config.json` to override both.
+
 ### Checking the estimate against your bill
 
 `scripts/pet-cost-audit.py` replays a session transcript and prices every request by its own timestamp's tariff. It deduplicates by message id first — Claude Code writes the same API response into the transcript 2–4 times, so summing the records naively overstates tokens by ~2.5x:

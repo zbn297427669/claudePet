@@ -180,14 +180,18 @@ cur_year, next_year = int(cur_year), int(next_year)
 BUILTIN_CHECKED_ON = "2026-10-11"
 BUILTIN_PEAK_DAYS = [1, 2, 3, 4, 5]
 BUILTIN_PEAK_WINDOWS = [["01:00", "04:00"], ["06:00", "10:00"]]
+# The docs list one context length for both card models ("CONTEXT LENGTH 1M")
+BUILTIN_CONTEXT_TOKENS = 1_000_000
 BUILTIN_CARD = {
     "deepseek-flash": {
         "matched": "DeepSeek-V4.1-Flash",
+        "context_tokens": BUILTIN_CONTEXT_TOKENS,
         "off_peak": {"input_per_mtok": 0.15, "output_per_mtok": 0.60, "cache_read_per_mtok": 0.003},
         "peak":     {"input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006},
     },
     "deepseek-v4-pro": {
         "matched": "DeepSeek-V4-Pro-0813",
+        "context_tokens": BUILTIN_CONTEXT_TOKENS,
         "off_peak": {"input_per_mtok": 0.66, "output_per_mtok": 1.98, "cache_read_per_mtok": 0.022},
         "peak":     {"input_per_mtok": 1.32, "output_per_mtok": 3.96, "cache_read_per_mtok": 0.044},
     },
@@ -240,22 +244,29 @@ ROW_RE = {
 
 
 def parse_docs(text: str):
-    """Return (card, peak_days, peak_windows) scraped from the pricing page."""
+    """Return (card, peak_days, peak_windows, context_tokens) from the pricing page."""
     rows = {}
     for key, rx in ROW_RE.items():
         m = rx.search(text)
         if not m:
-            return None, None, None
+            return None, None, None, None
         off_f, off_p, pk_f, pk_p = (parse_money(g) for g in m.groups())
         if None in (off_f, off_p, pk_f, pk_p):
-            return None, None, None
+            return None, None, None, None
         # column order: docs list deepseek-flash then deepseek-v4-pro
         rows[key] = {"off_f": off_f, "off_p": off_p, "pk_f": pk_f, "pk_p": pk_p}
+
+    context_tokens = None
+    m = re.search(r"CONTEXT LENGTH\s+([0-9.]+)\s*([KM]?)", text, re.I)
+    if m:
+        scale = {"M": 1_000_000, "K": 1_000, "": 1}[m.group(2).upper()]
+        context_tokens = int(float(m.group(1)) * scale)
 
     card = {}
     for alias in BUILTIN_CARD:
         builtin = BUILTIN_CARD[alias]
-        card[alias] = {"matched": builtin["matched"], "off_peak": {}, "peak": {}}
+        card[alias] = {"matched": builtin["matched"], "off_peak": {}, "peak": {},
+                       "context_tokens": context_tokens or BUILTIN_CONTEXT_TOKENS}
         suffix = "_f" if alias == "deepseek-flash" else "_p"
         for key in RATE_KEYS:
             row = rows[ROW_FOR_RATE[key]]
@@ -266,7 +277,7 @@ def parse_docs(text: str):
                   r"([\d:]{4,5})\s*-\s*([\d:]{4,5})\s*UTC", text)
     windows = [[m.group(1), m.group(2)], [m.group(3), m.group(4)]] if m else None
     days = BUILTIN_PEAK_DAYS if re.search(r"Monday\s+(?:through|to)\s+Friday", text, re.I) else None
-    return card, days, windows
+    return card, days, windows, context_tokens
 
 
 def card_is_plausible(card: dict) -> bool:
@@ -297,14 +308,13 @@ card = None
 card_source = None
 peak_days, peak_windows = BUILTIN_PEAK_DAYS, BUILTIN_PEAK_WINDOWS
 if docs_path and os.path.exists(docs_path):
+    parse_error = None
     try:
-        scraped, days_seen, windows_seen = parse_docs(flatten(Path(docs_path).read_text(
+        scraped, days_seen, windows_seen, ctx_seen = parse_docs(flatten(Path(docs_path).read_text(
             encoding="utf-8", errors="replace")))
     except Exception as exc:
-        # Say why: silently falling back once hid a KeyError in here for a while
-        print(f"note: deepseek pricing page unreadable ({exc!r}); using built-in card",
-              file=sys.stderr)
-        scraped, days_seen, windows_seen = None, None, None
+        parse_error = exc
+        scraped, days_seen, windows_seen, ctx_seen = None, None, None, None
     if scraped and card_is_plausible(scraped):
         card, card_source = scraped, "deepseek-docs"
         if days_seen:
@@ -316,7 +326,11 @@ if docs_path and os.path.exists(docs_path):
                   file=sys.stderr)
     elif scraped:
         print("note: deepseek page failed validation; using built-in card", file=sys.stderr)
-    elif scraped is None:
+    elif parse_error is not None:
+        # Say why: silently falling back once hid a KeyError in here for a while
+        print(f"note: deepseek pricing page unreadable ({parse_error!r}); using built-in card",
+              file=sys.stderr)
+    else:
         print("note: deepseek page layout not recognised; using built-in card", file=sys.stderr)
 if card is None:
     card, card_source = BUILTIN_CARD, "deepseek-builtin"
@@ -360,6 +374,9 @@ def load_catalog(path):
             "input_per_mtok": prompt * 1e6,
             "output_per_mtok": completion * 1e6,
             "cache_read_per_mtok": cache_read * 1e6,
+            # the status line uses this to size the context bar for models whose
+            # window Claude Code does not know (gateway aliases fall back to 200k)
+            "context_tokens": m.get("context_length") or None,
         })
     return entries
 
@@ -525,11 +542,14 @@ for alias in aliases:
             "source": card_source,
             "checked_on": BUILTIN_CHECKED_ON if card_source == "deepseek-builtin" else None,
             "matched": entry["matched"],
+            "context_tokens": entry.get("context_tokens"),
             "peak": entry["peak"],
             "off_peak": entry["off_peak"],
         }
         if merged["checked_on"] is None:
             del merged["checked_on"]
+        if merged["context_tokens"] is None:
+            del merged["context_tokens"]
         e = best_match(alias, or_entries) if or_ok else None
         if e:
             flat = {k: round(e[k], 6) for k in RATE_KEYS}
@@ -545,10 +565,13 @@ for alias in aliases:
             models[alias] = {
                 "source": "openrouter",
                 "matched": e["id"],
+                "context_tokens": e.get("context_tokens"),
                 "input_per_mtok": round(e["input_per_mtok"], 6),
                 "output_per_mtok": round(e["output_per_mtok"], 6),
                 "cache_read_per_mtok": round(e["cache_read_per_mtok"], 6),
             }
+            if models[alias]["context_tokens"] is None:
+                del models[alias]["context_tokens"]
 
 # Keep entries for models that dropped out of the watch list, so a config edit
 # cannot silently unprice a model the status line is still asked about.
@@ -589,10 +612,12 @@ for alias, info in list(models.items())[:10]:
         flag = "  [MISMATCH vs openrouter]" if info.get("price_mismatch") else ""
         print(f"  {alias} → {info['matched']}  "
               f"off-peak in=${off['input_per_mtok']}/MTok hit=${off['cache_read_per_mtok']} "
-              f"out=${off['output_per_mtok']} | peak out=${pk['output_per_mtok']}{flag}",
+              f"out=${off['output_per_mtok']} | peak out=${pk['output_per_mtok']} "
+              f"| ctx={info.get('context_tokens') or '?'}{flag}",
               file=sys.stderr)
     else:
         print(f"  {alias} → {info.get('matched', '?')}  "
-              f"in=${info.get('input_per_mtok')}/MTok out=${info.get('output_per_mtok')}",
+              f"in=${info.get('input_per_mtok')}/MTok out=${info.get('output_per_mtok')} "
+              f"| ctx={info.get('context_tokens') or '?'}",
               file=sys.stderr)
 PY

@@ -34,7 +34,7 @@ fi
 # ── Step 1: Install dependencies and build ────────────────────────────────────
 echo "[1/5] Installing dependencies..."
 cd "$SCRIPT_DIR"
-npm install --silent 2>&1 | tail -1
+npm install --ignore-scripts --silent 2>&1 | tail -1
 echo "[2/5] Building..."
 npm run build --silent 2>&1
 echo "  Done."
@@ -84,6 +84,14 @@ if cp "$SCRIPT_DIR/skills/pet/SKILL.md" "$HOME/.claude/skills/pet/SKILL.md" 2>/d
 else
   echo "  Warning: Could not install /pet command. Copy skills/pet/SKILL.md to ~/.claude/skills/pet/ manually."
 fi
+# Optional FX updater used by statusline (TTL-cached)
+if [[ -f "$SCRIPT_DIR/scripts/update-fx-rate.sh" ]]; then
+  ln -sfn "$SCRIPT_DIR/scripts/update-fx-rate.sh" "$PET_DATA_DIR/update-fx-rate.sh"
+fi
+if [[ -f "$SCRIPT_DIR/scripts/update-model-pricing.sh" ]]; then
+  ln -sfn "$SCRIPT_DIR/scripts/update-model-pricing.sh" "$PET_DATA_DIR/update-model-pricing.sh"
+fi
+
 echo "  Data files ready."
 
 # ── Step 3: Register MCP server ───────────────────────────────────────────────

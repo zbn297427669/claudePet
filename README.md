@@ -25,6 +25,7 @@ Then restart Claude Code. Your pet appears in the status line.
 ## What You Get
 
 - **Pixel creature** in your status line that evolves through 5 stages
+- **Richer status line metrics** — ASCII context bar with used/size tokens, cache hit rate (`cache 99% · 207k`), output tokens, session duration, and lines changed
 - **Prompt scoring** across 5 dimensions (specificity, context, actionability, scope, constraints)
 - **XP system** — better prompts = more XP = faster evolution
 - **9 creature families** — randomly assigned, each with unique personality and voice
@@ -108,6 +109,52 @@ Remove the `UserPromptSubmit` hook and `statusLine` entries from `~/.claude/sett
 
 </details>
 
+
+
+<details>
+<summary>Model pricing estimates (optional)</summary>
+
+For non-Anthropic / gateway models, Claude Code's built-in USD cost may be wrong or zero. Optionally maintain a local `$/MTok` table:
+
+```bash
+# discover models from CCR config.sqlite when present, or set:
+export PET_PRICING_WATCH=my-model,other-model
+~/.claude/claude-pet/update-model-pricing.sh --force
+```
+
+Prices are fetched from the **OpenRouter public catalog** as an approximation — not official vendor billing. Matched rates land in `config.json` under `pricing.models`.
+
+When a match exists, the status line may recompute an **estimate** from recent `current_usage` snapshots. This can undercount (for example if the session started before pricing was enabled). Disable with `PET_PRICING_COST=0` to keep Claude's `total_cost_usd`.
+
+</details>
+
+<details>
+<summary>Local currency (optional)</summary>
+
+Claude Code reports cost in USD. To show a local currency in the status line, set `~/.claude/claude-pet/config.json`:
+
+```json
+{
+  "display": true,
+  "currency": {
+    "code": "CNY",
+    "symbol": "¥",
+    "usd_rate": 7.2,
+    "show_usd": false
+  }
+}
+```
+
+`./install.sh` symlinks `update-fx-rate.sh` into `~/.claude/claude-pet/`. The status line refreshes the USD→local rate in the background when the cache is older than 24h (override with `PET_FX_TTL_HOURS`, disable with `PET_FX_UPDATE=0`).
+
+Manual refresh:
+
+```bash
+~/.claude/claude-pet/update-fx-rate.sh --force
+```
+
+</details>
+
 <details>
 <summary>Data files</summary>
 
@@ -115,7 +162,7 @@ Pet state persists in `~/.claude/claude-pet/`:
 - `state.json` — XP, level, streaks, milestones, assigned family
 - `sprites.json` — block-art creature sprites
 - `creatures.json` — creature registry
-- `config.json` — display toggle
+- `config.json` — display toggle and optional `currency` settings
 - `prompt-history.json` — last 50 scored prompts
 
 </details>

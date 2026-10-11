@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branches filter: it matches the *base* branch, so a stacked PR (base
+  # pointing at another feature branch) would silently get no CI at all.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:

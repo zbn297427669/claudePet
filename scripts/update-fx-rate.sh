@@ -29,6 +29,7 @@ CODE=$(printf '%s' "$CODE" | tr '[:lower:]' '[:upper:]')
 case "$CODE" in
   USD|"") exit 0 ;;
   RMB) CODE=CNY ;;
+  *) ;;
 esac
 
 needs_update() {

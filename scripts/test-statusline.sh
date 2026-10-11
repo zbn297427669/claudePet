@@ -224,6 +224,66 @@ PY
 sess_render "$FLAT1" NEW 1 >/dev/null
 check "the session map is capped"             "$(jq '.sessions | length' "$PET_DIR/cost-state.json")" "20"
 
+# ── peak-tariff alert ────────────────────────────────────────────────────────
+# Peak costs double, so past a cost threshold the warning moves to the front of
+# the line with a countdown; before peak starts it pre-warns instead. Every knob
+# is meant to be configurable, so each one gets a case.
+PEAK_CONFIG='{"display":true,"currency":{"code":"CNY","symbol":"¥","usd_rate":6.70036411},
+  "peak_alert":{"enabled":true,"countdown":true,"pre_warn_minutes":15,"cost_threshold":1,"show_premium":true},
+  "pricing":{"tier_mode":"auto","peak_days":[1,2,3,4,5],
+   "peak_windows":[["01:00","04:00"],["06:00","10:00"]],"off_peak_dates":["2026-10-01"],
+   "models":{"deepseek-flash":{"context_tokens":1000000,
+     "off_peak":{"input_per_mtok":0.15,"output_per_mtok":0.6,"cache_read_per_mtok":0.003},
+     "peak":{"input_per_mtok":0.3,"output_per_mtok":1.2,"cache_read_per_mtok":0.006}}}}}'
+
+peak_cfg() { jq -c "$1" <<< "$PEAK_CONFIG" > "$PET_DIR/config.json"; }
+
+peak_render() { # $1=now (UTC) $2=cache-read tokens; 30M ≈ ¥1.22 at peak rates
+  rm -f "$PET_DIR/cost-state.json"
+  {
+    printf '{"model":{"display_name":"deepseek-flash","id":"deepseek-flash"},"session_id":"t",'
+    printf '"workspace":{"current_dir":"/tmp/pet"},"context_window":{"used_percentage":50,'
+    printf '"context_window_size":200000,"current_usage":{"input_tokens":1000,'
+    printf '"cache_creation_input_tokens":0,"cache_read_input_tokens":%s,"output_tokens":2000}},' "$2"
+    printf '"cost":{"total_cost_usd":49.33}}'
+  } | HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_NOW_UTC="$1" \
+      bash "$SL" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1
+}
+count_in() { grep -c "$1" <<< "$2"; }
+
+MON_PEAK=2026-10-12T02:00:00Z     # Monday, inside a peak window
+MON_OFF=2026-10-12T05:00:00Z      # Monday, between the windows
+MON_WARN=2026-10-12T05:50:00Z     # ten minutes before peak starts
+
+peak_cfg '.'
+line="$(peak_render "$MON_PEAK" 30000000)"
+check "peak over the threshold leads the line" "$(count_in '^⚡峰' "$line")" "1"
+check "countdown says when off-peak returns"   "$(count_in '⚡峰 2h00m' "$line")" "1"
+check "shows what peak has cost extra"         "$(count_in '+¥0\.6' "$line")" "1"
+check "the quiet trailing marker steps aside"  "$(count_in '¥1.2242 峰' "$line")" "0"
+
+peak_cfg '.peak_alert.cost_threshold = 99'
+check "below the threshold it stays quiet" \
+  "$(count_in '¥1.2242 峰' "$(peak_render "$MON_PEAK" 30000000)")" "1"
+
+peak_cfg '.'
+check "off-peak raises nothing at all" \
+  "$(count_in '⚡' "$(peak_render "$MON_OFF" 30000000)")" "0"
+check "pre-warns just before peak"  \
+  "$(count_in '⚡峰 10m 后' "$(peak_render "$MON_WARN" 30000000)")" "1"
+
+peak_cfg '.peak_alert.pre_warn_minutes = 0'
+check "pre-warning can be switched off" \
+  "$(count_in '⚡' "$(peak_render "$MON_WARN" 30000000)")" "0"
+
+peak_cfg '.peak_alert.enabled = false'
+check "enabled=false restores the old behaviour" \
+  "$(count_in '¥1.2242 峰' "$(peak_render "$MON_PEAK" 30000000)")" "1"
+
+peak_cfg '.peak_alert.countdown = false | .peak_alert.show_premium = false'
+check "countdown and premium can be switched off" \
+  "$(count_in '^⚡峰 │' "$(peak_render "$MON_PEAK" 30000000)")" "1"
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

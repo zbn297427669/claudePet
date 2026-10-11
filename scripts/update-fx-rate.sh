@@ -78,8 +78,42 @@ fi
 [[ -n "$RATE" ]] || exit 0
 awk -v r="$RATE" 'BEGIN{exit !(r+0 > 0 && r+0 < 1000)}' || exit 0
 
+# ── config lock ──────────────────────────────────────────────────────────────
+# update-model-pricing.sh rewrites this same config file whole, and the status
+# line launches both updaters in the background, so two unlocked writes could
+# drop one of the two tables. Same lock file for both scripts; a lock older than
+# a minute is treated as dead, and we fail open rather than stall a refresh.
+CONFIG_LOCK="${CONFIG}.lock"
+LOCK_HELD=0
+
+acquire_lock() {
+  local deadline=$(( SECONDS + 5 ))
+  while true; do
+    if ( set -o noclobber; printf '%s\n' "$$" >"$CONFIG_LOCK" ) 2>/dev/null; then
+      LOCK_HELD=1
+      return 0
+    fi
+    if [[ -f "$CONFIG_LOCK" ]] && [[ -n "$(find "$CONFIG_LOCK" -mmin +1 2>/dev/null)" ]]; then
+      rm -f "$CONFIG_LOCK"
+      continue
+    fi
+    if (( SECONDS >= deadline )); then
+      return 0   # fail open: a lost refresh beats a hung one
+    fi
+    sleep 0.1
+  done
+}
+
+release_lock() {
+  if (( LOCK_HELD )); then rm -f "$CONFIG_LOCK"; fi
+  return 0
+}
+
 NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 TMP=$(mktemp)
+trap 'release_lock; rm -f "$TMP"' EXIT
+
+acquire_lock
 jq --argjson rate "$RATE" --arg now "$NOW" --arg code "$CODE" '
   .currency = (.currency // {})
   | .currency.code = $code

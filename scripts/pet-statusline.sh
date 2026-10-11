@@ -73,6 +73,7 @@ IFS=$'\x1f' read -r \
 
 # Optional local $/MTok estimate (auto-updated); may undercount — see README
 COST_STATE="$PET_DIR/cost-state.json"
+COST_TIER=""   # set to peak/off_peak when the model carries a peak/off-peak card
 if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG" ]] && command -v python3 >/dev/null 2>&1; then
   COST_CUSTOM=$(
     PET_COST_STATE="$COST_STATE" python3 - "$PET_CONFIG" \
@@ -80,10 +81,14 @@ if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG" ]] && command -v pytho
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
       "${COST:-0}" <<'PY'
 import json, os, re, sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback = sys.argv[1:10]
 state_path = Path(os.environ.get("PET_COST_STATE") or Path.home() / ".claude/claude-pet/cost-state.json")
+
+# Fallback schedule if the config carries no schedule (peak windows are UTC)
+DEFAULT_PEAK_WINDOWS = [["01:00", "04:00"], ["06:00", "10:00"]]
 
 def norm(s: str) -> str:
     s = (s or "").lower().strip().split("/")[-1].lstrip("~").split(":")[0]
@@ -94,8 +99,9 @@ try:
 except Exception:
     print(fallback); raise SystemExit(0)
 
-models = ((cfg.get("pricing") or {}).get("models") or {})
-if not isinstance(models, dict) or not models:
+pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
+models = pricing.get("models") if isinstance(pricing.get("models"), dict) else {}
+if not models:
     print(fallback); raise SystemExit(0)
 
 candidates = []
@@ -137,10 +143,63 @@ if price is None:
 if not isinstance(price, dict):
     print(fallback); raise SystemExit(0)
 
+
+# ── peak / off-peak tier ────────────────────────────────────────────────────
+# DeepSeek bills peak hours (UTC, Mon-Fri 01:00-04:00 and 06:00-10:00) at double
+# the off-peak rate; every other hour, including weekends and Chinese public
+# holidays, is off-peak. Only entries carrying a peak/off_peak card take part.
+def utc_now():
+    override = os.environ.get("PET_NOW_UTC")
+    if override:                     # test hook: pin the clock
+        try:
+            return datetime.fromisoformat(override.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def pick_tier(now):
+    """'peak' or 'off_peak' for this moment, in UTC.
+
+    isoweekday() is deliberate: Monday is 1, matching peak_days as written.
+    The peak windows run 01:00-10:00 UTC = 09:00-18:00 Beijing, so for the
+    moments this decision is about, a Chinese holiday date and its UTC date
+    always fall on the same day.
+    """
+    mode = pricing.get("tier_mode")
+    if mode in ("peak", "off_peak"):
+        return mode
+    days = pricing.get("peak_days") or [1, 2, 3, 4, 5]
+    if now.isoweekday() not in days:
+        return "off_peak"
+    if now.date().isoformat() in set(pricing.get("off_peak_dates") or []):
+        return "off_peak"
+    hhmm = now.strftime("%H:%M")
+    for window in pricing.get("peak_windows") or DEFAULT_PEAK_WINDOWS:
+        try:
+            start, end = window
+        except (TypeError, ValueError):
+            continue
+        if start <= hhmm < end:
+            return "peak"
+    return "off_peak"
+
+
+tier = None
+if isinstance(price.get("peak"), dict) or isinstance(price.get("off_peak"), dict):
+    tier = pick_tier(utc_now())
+    chosen = price.get(tier)
+    if not isinstance(chosen, dict):
+        # a hand-written card with only one tier: use the other rather than nothing
+        chosen = price.get("peak" if tier == "off_peak" else "off_peak")
+    rates = chosen if isinstance(chosen, dict) else {}
+else:
+    rates = price      # flat catalogue price, no tiers
+
 try:
-    in_r = float(price.get("input_per_mtok") or 0)
-    out_r = float(price.get("output_per_mtok") or 0)
-    cr_r = float(price.get("cache_read_per_mtok") or 0)
+    in_r = float(rates.get("input_per_mtok") or 0)
+    out_r = float(rates.get("output_per_mtok") or 0)
+    cr_r = float(rates.get("cache_read_per_mtok") or 0)
     tin = float(u_in or 0); tcc = float(u_cc or 0); tcr = float(u_cr or 0); tout = float(u_out or 0)
 except Exception:
     print(fallback); raise SystemExit(0)
@@ -176,14 +235,23 @@ if fp != "0|0|0|0" and fp != last_fp:
     except Exception:
         pass
 
-# If we have no accumulated usage yet, fall back to Claude's number
+# If we have no accumulated usage yet, fall back to Claude's number.
+# The tier rides along after a "|" so the shell can label it; a bare number means
+# "no tier applies" (a flat catalogue price, or the fallback above).
 if total <= 0:
     print(fallback)
 else:
-    print(f"{total:.8f}")
+    print(f"{total:.8f}|{tier or ''}")
 PY
   )
-  [[ -n "$COST_CUSTOM" ]] && COST="$COST_CUSTOM"
+  if [[ -n "$COST_CUSTOM" ]]; then
+    COST="${COST_CUSTOM%%|*}"
+    case "${COST_CUSTOM##*|}" in
+      peak)     COST_TIER="peak" ;;
+      off_peak) COST_TIER="off_peak" ;;
+      *)        COST_TIER="" ;;
+    esac
+  fi
 fi
 
 # 15500 -> 15.5k, 200000 -> 200.0k, 1000000 -> 1.0M. Pure bash: awk here would be
@@ -252,18 +320,20 @@ DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")
 # One read for the whole file: this used to be four jq calls, and the background
 # FX updater can rewrite config.json mid-render — a single read is also a
 # consistent snapshot. The display toggle comes from the same read.
-CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""
+CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""; CFG_SHOW_TIER=""
 if [[ -f "$PET_CONFIG" ]]; then
-  IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL \
+  IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL CFG_SHOW_TIER \
     <<< "$(jq -r '[
       (if .display == false then "false" else "true" end),
       (.currency.code // ""),
       (.currency.usd_rate // ""),
       (if .currency.show_usd == true then "1" else "" end),
-      (.currency.symbol // "")
+      (.currency.symbol // ""),
+      (if .currency.show_tier == false then "0" else "" end)
     ] | map(tostring) | join("\u001f")' "$PET_CONFIG" 2>/dev/null)"
 fi
 PET_DISPLAY="${CFG_DISPLAY:-true}"
+SHOW_TIER="${PET_COST_TIER_LABEL:-${CFG_SHOW_TIER:-1}}"
 COST_CURRENCY="${PET_COST_CURRENCY:-$CFG_CODE}"
 USD_RATE="${PET_USD_RATE:-$CFG_RATE}"
 COST_SHOW_USD="${PET_COST_SHOW_USD:-$CFG_SHOW_USD}"
@@ -285,6 +355,13 @@ else
   else
     COST_FMT=$(printf '%s%s' "$COST_SYMBOL" "$COST_LOCAL")
   fi
+fi
+# Which DeepSeek tariff the running total was priced at: 谷 (off-peak) / 峰 (peak)
+if [[ -n "$COST_TIER" && "$SHOW_TIER" != "0" ]]; then
+  case "$COST_TIER" in
+    peak)     COST_FMT="${COST_FMT} 峰" ;;
+    off_peak) COST_FMT="${COST_FMT} 谷" ;;
+  esac
 fi
 DUR_S=$(( ${DUR_MS:-0} / 1000 ))
 if [[ "$DUR_S" -ge 3600 ]]; then

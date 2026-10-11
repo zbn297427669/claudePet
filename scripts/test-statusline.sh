@@ -73,6 +73,80 @@ out="$(HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
   bash "$SL" <<< 'not json' 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
 check "malformed stdin falls back to defaults" "$out" "⬡ Claude"
 
+# ── cost tiering ─────────────────────────────────────────────────────────────
+# render() above sets PET_PRICING_COST=0, so none of those assertions touch the
+# cost python at all. These do, with a pinned clock (PET_NOW_UTC) and a config
+# carrying a DeepSeek peak/off-peak card.
+CARD_CONFIG='{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{
+  "tier_mode":"auto","peak_days":[1,2,3,4,5],
+  "peak_windows":[["01:00","04:00"],["06:00","10:00"]],
+  "off_peak_dates":["2026-10-01"],
+  "models":{
+    "deepseek-flash":{"source":"deepseek-builtin",
+      "off_peak":{"input_per_mtok":0.15,"output_per_mtok":0.60,"cache_read_per_mtok":0.003},
+      "peak":{"input_per_mtok":0.30,"output_per_mtok":1.20,"cache_read_per_mtok":0.006}},
+    "glm-flat":{"input_per_mtok":0.1,"output_per_mtok":0.5,"cache_read_per_mtok":0.03}}}}'
+
+cost_payload() { # $1 = model id
+  printf '{"model":{"display_name":"%s","id":"%s"},"session_id":"t",' "$1" "$1"
+  printf '"workspace":{"current_dir":"/tmp/pet"},"context_window":{"used_percentage":10,'
+  printf '"context_window_size":200000,"current_usage":{"input_tokens":1000,'
+  printf '"cache_creation_input_tokens":0,"cache_read_input_tokens":100000,"output_tokens":2000}},'
+  printf '"cost":{"total_cost_usd":18.088}}'
+}
+
+cost_render() { # $1=config json  $2=model  $3=PET_NOW_UTC  $4=extra env
+  printf '%s' "$1" > "$PET_DIR/config.json"
+  rm -f "$PET_DIR/cost-state.json"     # each case starts a fresh accumulator
+  HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+    PET_NOW_UTC="$3" ${4:-} \
+    bash "$SL" <<< "$(cost_payload "${2:-deepseek-flash}")" 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g'
+}
+cost_of() { grep -o '\$[0-9.]*' <<< "$1" | head -1; }
+
+MON_PEAK=2026-10-12T02:00:00Z     # Monday, inside a peak window
+MON_GAP=2026-10-12T05:00:00Z      # Monday, between the two windows
+SUNDAY=2026-10-11T02:00:00Z       # weekend: off-peak all day
+HOLIDAY=2026-10-01T02:00:00Z      # National Day, a Thursday
+
+out_peak="$(cost_render "$CARD_CONFIG" deepseek-flash "$MON_PEAK")"
+out_off="$(cost_render "$CARD_CONFIG" deepseek-flash "$MON_GAP")"
+check "peak window is labelled 峰"      "$out_peak" "峰"
+check "between windows is labelled 谷"  "$out_off" "谷"
+check "weekend is off-peak"             "$(cost_render "$CARD_CONFIG" deepseek-flash "$SUNDAY")" "谷"
+check "holiday is off-peak"             "$(cost_render "$CARD_CONFIG" deepseek-flash "$HOLIDAY")" "谷"
+
+# Same request priced on both tariffs: the peak total must be exactly double
+python3 - "$(cost_of "$out_off")" "$(cost_of "$out_peak")" <<'PY'
+import sys
+off, pk = (float(x.lstrip("$")) for x in sys.argv[1:3])
+raise SystemExit(0 if abs(pk - 2 * off) < 0.0002 else 1)
+PY
+if (( $? == 0 )); then ok "peak total is exactly 2x the off-peak total"
+else bad "peak total is exactly 2x the off-peak total" "off=$out_off peak=$out_peak"; fi
+
+# A flat catalogue price has no tier to report
+out_flat="$(cost_render "$CARD_CONFIG" glm-flat "$MON_PEAK")"
+nocheck "flat model shows no tier"      "$out_flat" "峰"
+nocheck "flat model shows no tier"      "$out_flat" "谷"
+check "flat model still shows a cost"   "$out_flat" "\$"
+
+forced="$(jq -c '.pricing.tier_mode = "off_peak"' <<< "$CARD_CONFIG")"
+nocheck "tier_mode pins off-peak at peak hours" \
+  "$(cost_render "$forced" deepseek-flash "$MON_PEAK")" "峰"
+
+hidden="$(jq -c '.currency.show_tier = false' <<< "$CARD_CONFIG")"
+nocheck "currency.show_tier=false hides the label" \
+  "$(cost_render "$hidden" deepseek-flash "$MON_PEAK")" "峰"
+
+noenv="$(cost_render "$CARD_CONFIG" deepseek-flash "$MON_PEAK" PET_COST_TIER_LABEL=0)"
+nocheck "PET_COST_TIER_LABEL=0 hides the label" "$noenv" "峰"
+
+# No pricing block at all (what install.sh seeds on a fresh install)
+out_bare="$(cost_render '{"display":true}' deepseek-flash "$MON_PEAK")"
+check "config without pricing still renders" "$out_bare" "⬡"
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

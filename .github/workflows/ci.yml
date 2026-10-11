@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branches filter: it matches the *base* branch, so a stacked PR (base
+  # pointing at another feature branch) would silently get no CI at all.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -37,7 +38,9 @@ jobs:
             echo "bash -n $f"
             bash -n "$f" || exit 1
           done
-      - name: Status line smoke test
+      - name: Python syntax check
+        run: python3 -m py_compile scripts/pet-cost-audit.py
+      - name: Script tests (status line + pricing)
         run: npm run test:scripts
 
   # Community Edition：不需要 SEMGREP_APP_TOKEN。p/default 是精选规则。

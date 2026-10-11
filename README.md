@@ -128,6 +128,35 @@ Prices are fetched from the **OpenRouter public catalog** as an approximation �
 
 When a match exists, the status line may recompute an **estimate** from recent `current_usage` snapshots. This can undercount (for example if the session started before pricing was enabled). Disable with `PET_PRICING_COST=0` to keep Claude's `total_cost_usd`.
 
+### DeepSeek peak / off-peak
+
+DeepSeek charges two tariffs: peak is Mon–Fri **01:00–04:00 and 06:00–10:00 UTC** (09:00–12:00 and 14:00–18:00 Beijing), and everything else — including all weekends and Chinese public holidays — is off-peak at exactly half the peak rate. OpenRouter publishes a single price per model and cannot express this, so DeepSeek models get an official card instead, scraped from the [DeepSeek pricing page](https://api-docs.deepseek.com/quick_start/pricing/) and validated structurally before use (rates must be positive, off-peak exactly half of peak, and Flash cheaper than Pro in every category — the last check catches a column swap). If the page cannot be read, a card built in to `update-model-pricing.sh` is used instead. Holiday dates come from [holiday-cn](https://github.com/NateScarlet/holiday-cn).
+
+The status line prices each request at the tariff in force and marks the running total with **谷** (off-peak) or **峰** (peak). Hide the marker with `"currency": { "show_tier": false }` or `PET_COST_TIER_LABEL=0`.
+
+If your gateway does **not** follow DeepSeek's schedule, override it — either pin the tariff, or replace a model's card with your own flat or tiered rates (`"source": "user"` entries are never overwritten by a refresh):
+
+```json
+{ "pricing": {
+    "tier_mode": "off_peak",
+    "models": {
+      "deepseek-flash": { "source": "user",
+        "off_peak": { "input_per_mtok": 0.15, "output_per_mtok": 0.60, "cache_read_per_mtok": 0.003 },
+        "peak":     { "input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006 } } } } }
+```
+
+### Checking the estimate against your bill
+
+`scripts/pet-cost-audit.py` replays a session transcript and prices every request by its own timestamp's tariff. It deduplicates by message id first — Claude Code writes the same API response into the transcript 2–4 times, so summing the records naively overstates tokens by ~2.5x:
+
+```bash
+python3 scripts/pet-cost-audit.py                 # newest transcript for this project
+python3 scripts/pet-cost-audit.py --last-hours 2  # just the recent stretch
+python3 scripts/pet-cost-audit.py --paid 2.00     # compare against what you were billed
+```
+
+It also prints Claude Code's own `costUSD` and the status line's accumulator, so an over- or under-count is easy to spot.
+
 </details>
 
 <details>
@@ -173,13 +202,15 @@ Pet state persists in `~/.claude/claude-pet/`:
 ## Development
 
 ```bash
-npm test              # unit tests (jest) + status line smoke tests (bash)
+npm test              # unit tests (jest) + script tests (bash)
 npm run test:unit     # jest only
-npm run test:scripts  # status line only — no jest, runs against a temp $HOME
+npm run test:scripts  # status line + pricing updater, no jest, temp $HOME, no network
 npm run build         # tsc + copy data/ into dist/
 ```
 
-CI runs typecheck, unit tests, build, `bash -n` on every shell script, and the status line smoke test on Node 20 and 22, alongside the Semgrep scan.
+`test-pricing.sh` drives `update-model-pricing.sh` entirely from injected fixture files (`PET_PRICING_*_FILE`, `PET_PRICING_OFFLINE=1`), so the merge, validation and fallback paths are covered without touching the network or your real config.
+
+CI runs typecheck, unit tests, build, `bash -n` on every shell script, `py_compile` on the Python tool, and both script test suites on Node 20 and 22, alongside the Semgrep scan.
 
 ## Credits
 

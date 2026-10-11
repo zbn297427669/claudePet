@@ -91,13 +91,16 @@ def load_requests(path: Path, since: datetime | None):
             if since and ts and ts < since:
                 # still mark as seen: the same response may reappear later in the file
                 continue
-            seen.add(key)
-            order.append((ts, {
+            counters = {
                 "in": int(usage.get("input_tokens") or 0),
                 "cc": int(usage.get("cache_creation_input_tokens") or 0),
                 "cr": int(usage.get("cache_read_input_tokens") or 0),
                 "out": int(usage.get("output_tokens") or 0),
-            }, str(msg.get("model") or "")))
+            }
+            if not any(counters.values()):
+                continue        # a usage object with no numbers is not a billed request
+            seen.add(key)
+            order.append((ts, counters, str(msg.get("model") or "")))
     return order, duplicates
 
 
@@ -264,8 +267,12 @@ def main() -> int:
     }
     acc = None
     try:
-        acc = json.loads((Path(args.config).parent / "cost-state.json").read_text(encoding="utf-8"))
-        payload["statusline_accumulator_usd"] = acc.get("total_usd")
+        state = json.loads((Path(args.config).parent / "cost-state.json").read_text(encoding="utf-8"))
+        # per-session map; fall back to the older single-slot shape
+        sessions = state.get("sessions") if isinstance(state.get("sessions"), dict) else {}
+        entry = sessions.get(path.stem) if isinstance(sessions, dict) else None
+        acc = (entry or {}).get("total_usd") if isinstance(entry, dict) else state.get("total_usd")
+        payload["statusline_accumulator_usd"] = acc
     except Exception:
         pass
 
@@ -302,8 +309,8 @@ def main() -> int:
     if claude_usd:
         print(f"  {'Claude Code’s own number':<38} ${claude_usd:.4f}  "
               f"(priced as Anthropic; not meaningful on a gateway)")
-    if acc and acc.get("total_usd") is not None:
-        print(f"  {'status line accumulator':<38} ${acc['total_usd']:.4f}  {money(acc['total_usd'])}")
+    if acc:
+        print(f"  {'status line accumulator':<38} ${acc:.4f}  {money(acc)}")
 
     if args.paid is not None and head:
         paid_usd = args.paid / rate

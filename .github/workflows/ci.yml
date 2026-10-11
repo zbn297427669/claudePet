@@ -39,8 +39,12 @@ jobs:
             bash -n "$f" || exit 1
           done
       - name: Python syntax check
-        run: python3 -m py_compile scripts/pet-cost-audit.py
-      - name: Script tests (status line + pricing)
+        run: |
+          for f in scripts/*.py; do
+            echo "py_compile $f"
+            python3 -m py_compile "$f" || exit 1
+          done
+      - name: Script tests (status line + pricing + audit)
         run: npm run test:scripts
 
   # Community Edition：不需要 SEMGREP_APP_TOKEN。p/default 是精选规则。

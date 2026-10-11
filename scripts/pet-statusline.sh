@@ -11,15 +11,21 @@
 
 input=$(cat)
 
-# Refresh FX in background if cache stale (non-blocking)
+# Refresh FX / model pricing in background if cache stale (non-blocking)
 FX_UPDATER="${PET_FX_UPDATE_SCRIPT:-$HOME/.claude/claude-pet/update-fx-rate.sh}"
 if [[ "${PET_FX_UPDATE:-1}" != "0" && -x "$FX_UPDATER" ]]; then
   "$FX_UPDATER" >/dev/null 2>&1 &
+fi
+PRICE_UPDATER="${PET_PRICING_UPDATE_SCRIPT:-$HOME/.claude/claude-pet/update-model-pricing.sh}"
+if [[ "${PET_PRICING_UPDATE:-1}" != "0" && -x "$PRICE_UPDATER" ]]; then
+  "$PRICE_UPDATER" >/dev/null 2>&1 &
 fi
 
 # ── Parse JSON ───────────────────────────────────────────────────────────────
 # Claude Code statusline protocol: https://code.claude.com/docs/en/statusline
 MODEL=$(echo "$input"    | jq -r '.model.display_name // "Claude"')
+MODEL_ID=$(echo "$input" | jq -r '.model.id // empty')
+SESSION_ID=$(echo "$input" | jq -r '.session_id // .sessionId // empty')
 DIR=$(echo "$input"      | jq -r '.workspace.current_dir // .cwd // ""')
 PCT=$(echo "$input"      | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
 CTX_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
@@ -39,10 +45,127 @@ OUT_TOK=$(echo "$input"      | jq -r '.context_window.total_output_tokens // .co
 USAGE_IN=$(echo "$input"     | jq -r '.context_window.current_usage.input_tokens // 0')
 USAGE_CC=$(echo "$input"     | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
 USAGE_CR=$(echo "$input"     | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+USAGE_OUT=$(echo "$input"    | jq -r '.context_window.current_usage.output_tokens // 0')
 COST=$(echo "$input"         | jq -r '.cost.total_cost_usd // 0')
 DUR_MS=$(echo "$input"       | jq -r '.cost.total_duration_ms // 0')
 LINES_ADD=$(echo "$input"    | jq -r '.cost.total_lines_added // 0')
 LINES_DEL=$(echo "$input"    | jq -r '.cost.total_lines_removed // 0')
+
+# Optional local $/MTok estimate (auto-updated); may undercount — see README
+PET_CONFIG_EARLY="$HOME/.claude/claude-pet/config.json"
+COST_STATE="$HOME/.claude/claude-pet/cost-state.json"
+if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG_EARLY" ]] && command -v python3 >/dev/null 2>&1; then
+  COST_CUSTOM=$(
+    PET_COST_STATE="$COST_STATE" python3 - "$PET_CONFIG_EARLY" \
+      "${MODEL_ID:-}" "${MODEL:-}" "${SESSION_ID:-}" \
+      "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
+      "${COST:-0}" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+
+cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback = sys.argv[1:10]
+state_path = Path(os.environ.get("PET_COST_STATE") or Path.home() / ".claude/claude-pet/cost-state.json")
+
+def norm(s: str) -> str:
+    s = (s or "").lower().strip().split("/")[-1].lstrip("~").split(":")[0]
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+try:
+    cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+except Exception:
+    print(fallback); raise SystemExit(0)
+
+models = ((cfg.get("pricing") or {}).get("models") or {})
+if not isinstance(models, dict) or not models:
+    print(fallback); raise SystemExit(0)
+
+candidates = []
+for raw in (model_id, model_name):
+    if not raw:
+        continue
+    leaf = raw.split("/")[-1].lstrip("~").split(":")[0]
+    candidates.append(leaf)
+    candidates.append(norm(leaf))
+
+price = None
+# exact key first
+for c in candidates:
+    if c in models:
+        price = models[c]; break
+if price is None:
+    cn = [norm(c) for c in candidates if c]
+    best = None
+    for key, info in models.items():
+        kn = norm(key)
+        for c in cn:
+            if not c or not kn:
+                continue
+            sc = -1
+            if c == kn: sc = 100
+            elif c in kn or kn in c: sc = 80 - abs(len(c) - len(kn))
+            if sc >= 0 and (best is None or sc > best[0]):
+                best = (sc, info)
+        matched = (info or {}).get("matched") or ""
+        mn = norm(matched)
+        for c in cn:
+            if c and mn and (c == mn or c in mn or mn in c):
+                sc = 70 - abs(len(c) - len(mn))
+                if best is None or sc > best[0]:
+                    best = (sc, info)
+    if best:
+        price = best[1]
+
+if not isinstance(price, dict):
+    print(fallback); raise SystemExit(0)
+
+try:
+    in_r = float(price.get("input_per_mtok") or 0)
+    out_r = float(price.get("output_per_mtok") or 0)
+    cr_r = float(price.get("cache_read_per_mtok") or 0)
+    tin = float(u_in or 0); tcc = float(u_cc or 0); tcr = float(u_cr or 0); tout = float(u_out or 0)
+except Exception:
+    print(fallback); raise SystemExit(0)
+
+# last-request USD estimate
+delta = (tin * in_r + tcc * in_r + tcr * cr_r + tout * out_r) / 1e6
+fp = f"{int(tin)}|{int(tcc)}|{int(tcr)}|{int(tout)}"
+
+try:
+    st = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+except Exception:
+    st = {}
+if not isinstance(st, dict):
+    st = {}
+
+sid = session_id or ""
+if sid and st.get("session_id") != sid:
+    st = {"session_id": sid, "total_usd": 0.0, "last_fp": ""}
+
+total = float(st.get("total_usd") or 0.0)
+last_fp = st.get("last_fp") or ""
+if fp != "0|0|0|0" and fp != last_fp:
+    total += delta
+    st["last_fp"] = fp
+    st["total_usd"] = total
+    st["session_id"] = sid
+    st["model"] = model_id or model_name
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(state_path)
+    except Exception:
+        pass
+
+# If we have no accumulated usage yet, fall back to Claude's number
+if total <= 0:
+    print(fallback)
+else:
+    print(f"{total:.8f}")
+PY
+  )
+  [[ -n "$COST_CUSTOM" ]] && COST="$COST_CUSTOM"
+fi
 
 fmt_tokens() {
   # 15500 -> 15.5k, 200000 -> 200k, 1000000 -> 1.0M
@@ -117,7 +240,7 @@ LINES_FMT="+${LINES_ADD}/-${LINES_DEL}"
 PLAN=""
 
 # ── Context bar (10 chars) + numeric usage ───────────────────────────────────
-# ASCII #/- so terminals missing shade glyphs (▓/░) don't show mojibake.
+# ASCII #/- so terminals missing shade glyphs (▓/░) don't show �.
 [ -z "$PCT" ] && PCT=0
 BAR_W=10
 FILLED=$((PCT * BAR_W / 100))

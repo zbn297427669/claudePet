@@ -88,6 +88,9 @@ fi
 if [ -f "$SCRIPT_DIR/scripts/update-fx-rate.sh" ]; then
   ln -sfn "$SCRIPT_DIR/scripts/update-fx-rate.sh" "$PET_DATA_DIR/update-fx-rate.sh"
 fi
+if [ -f "$SCRIPT_DIR/scripts/update-model-pricing.sh" ]; then
+  ln -sfn "$SCRIPT_DIR/scripts/update-model-pricing.sh" "$PET_DATA_DIR/update-model-pricing.sh"
+fi
 
 echo "  Data files ready."
 

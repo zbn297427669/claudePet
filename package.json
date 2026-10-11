@@ -11,7 +11,7 @@
     "dev": "tsc --watch",
     "test": "npm run test:unit && npm run test:scripts",
     "test:unit": "node --experimental-vm-modules node_modules/.bin/jest",
-    "test:scripts": "bash scripts/test-statusline.sh && bash scripts/test-pricing.sh"
+    "test:scripts": "bash scripts/test-statusline.sh && bash scripts/test-pricing.sh && bash scripts/test-cost-audit.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

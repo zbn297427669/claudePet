@@ -89,6 +89,8 @@ state_path = Path(os.environ.get("PET_COST_STATE") or Path.home() / ".claude/cla
 
 # Fallback schedule if the config carries no schedule (peak windows are UTC)
 DEFAULT_PEAK_WINDOWS = [["01:00", "04:00"], ["06:00", "10:00"]]
+# Sessions kept in cost-state.json; older ones are dropped as new ones appear
+MAX_SESSIONS = 20
 
 def norm(s: str) -> str:
     s = (s or "").lower().strip().split("/")[-1].lstrip("~").split(":")[0]
@@ -225,22 +227,38 @@ except Exception:
 if not isinstance(st, dict):
     st = {}
 
-sid = session_id or ""
-if sid and st.get("session_id") != sid:
-    st = {"session_id": sid, "total_usd": 0.0, "last_fp": ""}
+# Accumulate per session. A single slot keyed by session id meant any id change
+# — resuming, or another session rendering at the same time — threw the running
+# total away and the status line appeared to reset.
+sid = session_id or "default"
+sessions = st.get("sessions") if isinstance(st.get("sessions"), dict) else {}
+if not sessions and st.get("session_id"):        # migrate the old single-slot shape
+    sessions = {st["session_id"]: {"total_usd": st.get("total_usd") or 0.0,
+                                   "last_fp": st.get("last_fp") or "",
+                                   "model": st.get("model") or ""}}
+entry = sessions.get(sid)
+if not isinstance(entry, dict):
+    entry = {"total_usd": 0.0, "last_fp": ""}
 
-total = float(st.get("total_usd") or 0.0)
-last_fp = st.get("last_fp") or ""
+total = float(entry.get("total_usd") or 0.0)
+last_fp = entry.get("last_fp") or ""
 if fp != "0|0|0|0" and fp != last_fp:
     total += delta
-    st["last_fp"] = fp
-    st["total_usd"] = total
-    st["session_id"] = sid
-    st["model"] = model_id or model_name
+    entry.update({
+        "total_usd": total,
+        "last_fp": fp,
+        "model": model_id or model_name,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    sessions[sid] = entry
+    if len(sessions) > MAX_SESSIONS:               # keep the map from growing forever
+        for stale in sorted(sessions, key=lambda k: sessions[k].get("updated_at") or "")[:-MAX_SESSIONS]:
+            sessions.pop(stale, None)
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.write_text(json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
         tmp.replace(state_path)
     except Exception:
         pass

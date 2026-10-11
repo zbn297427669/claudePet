@@ -182,6 +182,48 @@ check "explicit context_window_tokens wins" \
 check "without a price table the payload's size stands" \
   "$(ctx_render '{"display":true}' 200000 250)" "[##########] 250% 500.0k/200.0k"
 
+# ── per-session cost accumulator ─────────────────────────────────────────────
+# A single slot keyed by session id meant any id change — resuming, or a second
+# session rendering — threw the running total away and looked like a reset.
+FLAT1='{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{"models":{
+  "m":{"input_per_mtok":1,"output_per_mtok":2,"cache_read_per_mtok":0.1}}}}'
+
+sess_render() { # $1=config $2=session id $3=input tokens → echoes that session's total
+  printf '%s' "$1" > "$PET_DIR/config.json"
+  {
+    printf '{"model":{"display_name":"m","id":"m"},"session_id":"%s",' "$2"
+    printf '"workspace":{"current_dir":"/tmp/pet"},"context_window":{"used_percentage":10,'
+    printf '"context_window_size":200000,"current_usage":{"input_tokens":%s,' "$3"
+    printf '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}},'
+    printf '"cost":{}}'
+  } | HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+      bash "$SL" >/dev/null 2>&1
+  jq -r --arg s "$2" '.sessions[$s].total_usd // "none"' "$PET_DIR/cost-state.json" 2>/dev/null
+}
+
+rm -f "$PET_DIR/cost-state.json"
+check "session accumulates its first request" "$(sess_render "$FLAT1" A 1)" "0.000001"
+sess_render "$FLAT1" A 2 >/dev/null
+check "session keeps accumulating"            "$(sess_render "$FLAT1" A 3)" "0.000006"
+sess_render "$FLAT1" B 9 >/dev/null
+check "a second session gets its own total"   "$(jq -r '.sessions.B.total_usd' "$PET_DIR/cost-state.json")" "0.000009"
+check "switching sessions does not wipe A"    "$(jq -r '.sessions.A.total_usd' "$PET_DIR/cost-state.json")" "0.000006"
+
+printf '%s' '{"session_id":"OLD","total_usd":1.5,"last_fp":"1|0|0|0","model":"m"}' > "$PET_DIR/cost-state.json"
+check "the old single-slot file migrates"     "$(sess_render "$FLAT1" OLD 2)" "1.500002"
+
+python3 - "$PET_DIR/cost-state.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({"sessions": {
+    f"s{i}": {"total_usd": 1, "last_fp": f"{i}|0|0|0",
+              "updated_at": f"2026-01-{i + 1:02d}T00:00:00Z"}
+    for i in range(20)}}), encoding="utf-8")
+PY
+sess_render "$FLAT1" NEW 1 >/dev/null
+check "the session map is capped"             "$(jq '.sessions | length' "$PET_DIR/cost-state.json")" "20"
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

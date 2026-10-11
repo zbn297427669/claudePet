@@ -81,7 +81,7 @@ if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG" ]] && command -v pytho
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
       "${COST:-0}" <<'PY'
 import json, os, re, sys
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback = sys.argv[1:10]
@@ -208,6 +208,39 @@ if isinstance(price.get("peak"), dict) or isinstance(price.get("off_peak"), dict
 else:
     rates = price      # flat catalogue price, no tiers
 
+
+def next_switch(now):
+    """(seconds, direction) until the next tariff change, for the countdown.
+
+    Peak runs 01:00-04:00 and 06:00-10:00 UTC on configured peak days, so the
+    next change is either the end of the window we are in, or the start of the
+    next one within the coming week (holidays and weekends are skipped).
+    """
+    days = pricing.get("peak_days") or [1, 2, 3, 4, 5]
+    windows = pricing.get("peak_windows") or DEFAULT_PEAK_WINDOWS
+    holidays = set(pricing.get("off_peak_dates") or [])
+
+    def peak_day(d):
+        return d.isoweekday() in days and d.isoformat() not in holidays
+
+    def at(d, hhmm):
+        return datetime.combine(d, time(int(hhmm[:2]), int(hhmm[3:5])), tzinfo=timezone.utc)
+
+    if peak_day(now.date()):
+        for start, end in windows:
+            if start <= now.strftime("%H:%M") < end:
+                return max(0, int((at(now.date(), end) - now).total_seconds())), "to_off_peak"
+    for offset in range(8):
+        day = (now + timedelta(days=offset)).date()
+        if not peak_day(day):
+            continue
+        for start, _ in windows:
+            target = at(day, start)
+            if target > now:
+                return int((target - now).total_seconds()), "to_peak"
+    return 0, ""
+
+
 try:
     in_r = float(rates.get("input_per_mtok") or 0)
     out_r = float(rates.get("output_per_mtok") or 0)
@@ -219,6 +252,19 @@ except Exception:
 # last-request USD estimate
 delta = (tin * in_r + tcc * in_r + tcr * cr_r + tout * out_r) / 1e6
 fp = f"{int(tin)}|{int(tcc)}|{int(tcr)}|{int(tout)}"
+
+# What this request would have cost off-peak: the difference is the peak premium
+premium_delta = 0.0
+if tier == "peak" and isinstance(price.get("off_peak"), dict):
+    try:
+        off = price["off_peak"]
+        o_in = float(off.get("input_per_mtok") or 0)
+        o_out = float(off.get("output_per_mtok") or 0)
+        o_cr = float(off.get("cache_read_per_mtok") or 0)
+        off_cost = (tin * o_in + tcc * o_in + tcr * o_cr + tout * o_out) / 1e6
+        premium_delta = max(0.0, delta - off_cost)
+    except (TypeError, ValueError):
+        premium_delta = 0.0
 
 try:
     st = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
@@ -250,6 +296,8 @@ if fp != "0|0|0|0" and fp != last_fp:
         "model": model_id or model_name,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
+    if premium_delta:
+        entry["premium_usd"] = float(entry.get("premium_usd") or 0.0) + premium_delta
     sessions[sid] = entry
     if len(sessions) > MAX_SESSIONS:               # keep the map from growing forever
         for stale in sorted(sessions, key=lambda k: sessions[k].get("updated_at") or "")[:-MAX_SESSIONS]:
@@ -264,18 +312,39 @@ if fp != "0|0|0|0" and fp != last_fp:
         pass
 
 # If we have no accumulated usage yet, fall back to Claude's number.
-# Fields: <usd>|<peak|off_peak|>|<context tokens, when known>
-if total <= 0:
-    print(f"{fallback}||{ctx_tokens or ''}")
-else:
-    print(f"{total:.8f}|{tier or ''}|{ctx_tokens or ''}")
+# Fields: <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>
+# The last four describe the tariff, so they are emitted even when the cost had
+# to fall back — the shell decides how loudly to say it.
+switch_secs, switch_dir = next_switch(utc_now()) if tier else (0, "")
+premium = float(entry.get("premium_usd") or 0.0)
+print("|".join([
+    f"{total:.8f}" if total > 0 else fallback,
+    tier or "",
+    str(ctx_tokens or ""),
+    str(switch_secs or ""),
+    switch_dir or "",
+    f"{premium:.6f}" if premium else "",
+]))
 PY
   )
   if [[ -n "$COST_CUSTOM" ]]; then
-    # <usd>|<tier>|<context tokens>; a bare number means neither was available
-    IFS='|' read -r COST COST_TIER COST_WINDOW <<< "$COST_CUSTOM"
+    # <usd>|<tier>|<context tokens>|<secs to switch>|<direction>|<premium usd>
+    # a bare number means none of it was available
+    IFS='|' read -r COST COST_TIER COST_WINDOW COST_SECS COST_DIR COST_PREMIUM <<< "$COST_CUSTOM"
   fi
 fi
+
+# Durations for the peak countdown: 1h52m, 15m, <1m
+fmt_dur() {
+  local s="${1:-0}"
+  if (( s >= 3600 )); then
+    printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60))
+  elif (( s >= 60 )); then
+    printf '%dm' $((s / 60))
+  else
+    printf '<1m'
+  fi
+}
 
 # 15500 -> 15.5k, 200000 -> 200.0k, 1000000 -> 1.0M. Pure bash: awk here would be
 # a fork per call, four per render. Rounds to one decimal like printf %.1f did.
@@ -344,9 +413,10 @@ DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")
 # FX updater can rewrite config.json mid-render — a single read is also a
 # consistent snapshot. The display toggle comes from the same read.
 CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""; CFG_SHOW_TIER=""
-CFG_CTX_WINDOW=""
+CFG_CTX_WINDOW=""; CFG_PK_ENABLED=""; CFG_PK_COUNTDOWN=""; CFG_PK_PREWARN=""; CFG_PK_THRESHOLD=""; CFG_PK_PREMIUM=""
 if [[ -f "$PET_CONFIG" ]]; then
   IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL CFG_SHOW_TIER CFG_CTX_WINDOW \
+    CFG_PK_ENABLED CFG_PK_COUNTDOWN CFG_PK_PREWARN CFG_PK_THRESHOLD CFG_PK_PREMIUM \
     <<< "$(jq -r '[
       (if .display == false then "false" else "true" end),
       (.currency.code // ""),
@@ -354,11 +424,25 @@ if [[ -f "$PET_CONFIG" ]]; then
       (if .currency.show_usd == true then "1" else "" end),
       (.currency.symbol // ""),
       (if .currency.show_tier == false then "0" else "" end),
-      (.context_window_tokens // "")
+      (.context_window_tokens // ""),
+      (if .peak_alert.enabled == false then "0" else "1" end),
+      (if .peak_alert.countdown == false then "0" else "1" end),
+      (.peak_alert.pre_warn_minutes // ""),
+      (.peak_alert.cost_threshold // ""),
+      (if .peak_alert.show_premium == false then "0" else "1" end)
     ] | map(tostring) | join("\u001f")' "$PET_CONFIG" 2>/dev/null)"
 fi
 PET_DISPLAY="${CFG_DISPLAY:-true}"
 SHOW_TIER="${PET_COST_TIER_LABEL:-${CFG_SHOW_TIER:-1}}"
+# Peak-tariff alert settings (see README). Re-read every render, so editing
+# config.json takes effect on the next one — thresholds included.
+PK_ENABLED="${PET_PEAK_ALERT:-${CFG_PK_ENABLED:-1}}"
+PK_COUNTDOWN="${PET_PEAK_COUNTDOWN:-${CFG_PK_COUNTDOWN:-1}}"
+PK_PRE_WARN="${PET_PEAK_PRE_WARN_MINUTES:-${CFG_PK_PREWARN:-15}}"
+PK_THRESHOLD="${PET_PEAK_COST_THRESHOLD:-${CFG_PK_THRESHOLD:-1}}"
+PK_PREMIUM="${PET_PEAK_PREMIUM:-${CFG_PK_PREMIUM:-1}}"
+[[ "$PK_PRE_WARN" =~ ^[0-9]+$ ]] || PK_PRE_WARN=15
+[[ "$PK_THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || PK_THRESHOLD=1
 COST_CURRENCY="${PET_COST_CURRENCY:-$CFG_CODE}"
 USD_RATE="${PET_USD_RATE:-$CFG_RATE}"
 COST_SHOW_USD="${PET_COST_SHOW_USD:-$CFG_SHOW_USD}"
@@ -381,8 +465,15 @@ else
     COST_FMT=$(printf '%s%s' "$COST_SYMBOL" "$COST_LOCAL")
   fi
 fi
-# Which DeepSeek tariff the running total was priced at: 谷 (off-peak) / 峰 (peak)
-if [[ -n "$COST_TIER" && "$SHOW_TIER" != "0" ]]; then
+# Which DeepSeek tariff the running total was priced at: 谷 / 峰. Past the cost
+# threshold the peak warning moves to the front of the line instead (below), so
+# this trailing marker stays quiet then rather than saying it twice.
+PK_LOUD=0
+if [[ "$PK_ENABLED" != "0" && "$COST_TIER" = "peak" ]]; then
+  COST_NUM=$(awk -v c="${COST:-0}" -v r="${USD_RATE:-1}" 'BEGIN{printf "%.6f", c*r}')
+  awk -v c="$COST_NUM" -v t="$PK_THRESHOLD" 'BEGIN{exit !(c >= t)}' && PK_LOUD=1
+fi
+if [[ -n "$COST_TIER" && "$SHOW_TIER" != "0" && "$PK_LOUD" = "0" ]]; then
   case "$COST_TIER" in
     peak)     COST_FMT="${COST_FMT} 峰" ;;
     off_peak) COST_FMT="${COST_FMT} 谷" ;;
@@ -454,10 +545,35 @@ GRAY="\033[38;5;245m"
 DIM="\033[38;5;238m"
 SEP="${DIM} │ ${RST}"
 
+# ── Peak-tariff alert ────────────────────────────────────────────────────────
+# Peak costs double, so say it where the eye lands first: the start of the line.
+# Only past the cost threshold, or it would shout through the ~7h of every
+# weekday that is peak. Pre-warning fires just before peak starts, which is the
+# actionable half — it is the moment to decide whether to wait.
+PK_PREFIX=""
+AMBER="\033[1;38;5;214m"
+if [[ "$PK_ENABLED" != "0" ]]; then
+  if (( PK_LOUD )); then
+    PK_PREFIX="${AMBER}⚡峰"
+    if [[ "$PK_COUNTDOWN" != "0" ]] && (( ${COST_SECS:-0} > 0 )); then
+      PK_PREFIX="${PK_PREFIX} $(fmt_dur "${COST_SECS:-0}")"
+    fi
+    if [[ "$PK_PREMIUM" != "0" && -n "${COST_PREMIUM:-}" ]] \
+       && awk -v p="$COST_PREMIUM" 'BEGIN{exit !(p > 0.0001)}'; then
+      PK_PREFIX="${PK_PREFIX} +$(printf '%s%.2f' "$COST_SYMBOL" \
+        "$(awk -v p="$COST_PREMIUM" -v r="$USD_RATE" 'BEGIN{printf "%.2f", p*r}')")"
+    fi
+    PK_PREFIX="${PK_PREFIX}${RST}${SEP}"
+  elif [[ "$COST_TIER" = "off_peak" && "$PK_PRE_WARN" -gt 0 && "${COST_DIR:-}" = "to_peak" ]] \
+       && (( ${COST_SECS:-0} > 0 )) && (( ${COST_SECS:-0} <= PK_PRE_WARN * 60 )); then
+    PK_PREFIX="${AMBER}⚡峰 $(fmt_dur "${COST_SECS:-0}") 后${RST}${SEP}"
+  fi
+fi
+
 # ── Assemble status bar ──────────────────────────────────────────────────────
 # Example:
 #   ⬡ model │ claudePet │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
-L=""
+L="$PK_PREFIX"
 [[ -n "$PLAN" ]] && L="${GRAY}${PLAN}${RST}${SEP}"
 L="${L}${GRAY}⬡ ${MODEL}${RST}"
 L="${L}${SEP}${GRAY}${DIR_DISPLAY}${RST}"

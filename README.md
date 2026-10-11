@@ -149,6 +149,33 @@ If your gateway does **not** follow DeepSeek's schedule, override it — either 
 
 Claude Code reports `context_window_size` as **200000** for any model it does not recognise as extended-context, which understates a gateway model — DeepSeek Flash is 1M. So the bar prefers the limit recorded on the model's entry: the `CONTEXT LENGTH` row of the DeepSeek page, or OpenRouter's `context_length` for other models. It wins only when it is **larger** than the payload's value, and when it wins the percentage is recomputed with the same input-only formula Claude Code documents (`input + cache_creation + cache_read`), so the bar, the percentage and the `used/size` numbers agree. Set `"context_window_tokens": 1000000` in `config.json` to override both.
 
+### Peak-tariff alert
+
+Peak costs exactly double, so once the session passes a cost threshold the warning moves to where the eye lands first — the start of the line — with a countdown to the cheaper rate:
+
+```
+⚡峰 1h52m +¥0.61 │ ⬡ deepseek-flash │ claudePet │ [#####-----] 53% 530.0k/1.0M │ cache 99% · 529.7k │ ¥1.2242 │ 2h00m
+```
+
+- `⚡峰 1h52m` — in peak, and the off-peak rate returns in 1h52m (peak windows, weekends and holidays are all taken from the same config the prices use)
+- `+¥0.61` — what the peak tariff has cost **extra** this session, versus having run entirely off-peak
+
+Below the threshold it stays quiet — a plain grey `峰` after the cost, exactly as before — so it does not shout through the ~7 peak hours of every weekday. Just before peak starts it pre-warns instead (`⚡峰 15m 后`), which is the actionable moment: decide whether to wait.
+
+Every knob is optional and re-read on every render, so an edit applies to the next one — threshold included:
+
+```json
+{ "peak_alert": {
+    "enabled": true,          // false = never raise, keep the quiet marker
+    "countdown": true,        // time until the rate next changes
+    "pre_warn_minutes": 15,   // 0 = no pre-warning before peak
+    "cost_threshold": 1,      // in the display currency; below it, stay quiet
+    "show_premium": true      // what peak has cost extra this session
+} }
+```
+
+Env overrides for one-off use: `PET_PEAK_ALERT=0`, `PET_PEAK_COUNTDOWN=0`, `PET_PEAK_PRE_WARN_MINUTES=0`, `PET_PEAK_COST_THRESHOLD=5`, `PET_PEAK_PREMIUM=0`.
+
 ### Checking the estimate against your bill
 
 `scripts/pet-cost-audit.py` replays a session transcript and prices every request by its own timestamp's tariff. It deduplicates by message id first — Claude Code writes the same API response into the transcript 2–4 times, so summing the records naively overstates tokens by ~2.5x:

@@ -147,6 +147,41 @@ nocheck "PET_COST_TIER_LABEL=0 hides the label" "$noenv" "峰"
 out_bare="$(cost_render '{"display":true}' deepseek-flash "$MON_PEAK")"
 check "config without pricing still renders" "$out_bare" "⬡"
 
+# ── context window ───────────────────────────────────────────────────────────
+# Claude Code reports 200000 for models it does not recognise as extended-
+# context, which understates a gateway model, so the model card's limit wins.
+CTX_CONFIG='{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{"models":{
+  "deepseek-flash":{"source":"deepseek-docs","context_tokens":1000000,
+    "off_peak":{"input_per_mtok":0.15,"output_per_mtok":0.6,"cache_read_per_mtok":0.003},
+    "peak":{"input_per_mtok":0.3,"output_per_mtok":1.2,"cache_read_per_mtok":0.006}}}}}'
+
+ctx_payload() { # $1=context_window_size  $2=used_percentage
+  printf '{"model":{"display_name":"deepseek-flash","id":"deepseek-flash"},"session_id":"t",'
+  printf '"workspace":{"current_dir":"/tmp/pet"},"context_window":{"used_percentage":%s,' "$2"
+  printf '"context_window_size":%s,"current_usage":{"input_tokens":1000,' "$1"
+  printf '"cache_creation_input_tokens":0,"cache_read_input_tokens":499000,"output_tokens":10}},'
+  printf '"cost":{"total_cost_usd":1}}'
+}
+
+ctx_render() { # $1=config  $2=payload window  $3=payload percentage
+  printf '%s' "$1" > "$PET_DIR/config.json"
+  rm -f "$PET_DIR/cost-state.json"
+  HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+    PET_NOW_UTC=2026-10-12T05:00:00Z \
+    bash "$SL" <<< "$(ctx_payload "$2" "$3")" 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g' | grep -o '\[.*% [0-9.]*[kM]*/[0-9.]*[kM]*'
+}
+
+check "model limit overrides Claude Code's 200k default" \
+  "$(ctx_render "$CTX_CONFIG" 200000 250)" "[#####-----] 50% 500.0k/1.0M"
+check "keeps a larger size when the payload knows better" \
+  "$(ctx_render "$CTX_CONFIG" 2000000 25)" "[##--------] 25% 500.0k/2.0M"
+check "explicit context_window_tokens wins" \
+  "$(ctx_render '{"display":true,"context_window_tokens":500000}' 200000 250)" \
+  "[##########] 100% 500.0k/500.0k"
+check "without a price table the payload's size stands" \
+  "$(ctx_render '{"display":true}' 200000 250)" "[##########] 250% 500.0k/200.0k"
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

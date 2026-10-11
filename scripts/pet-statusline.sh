@@ -143,6 +143,16 @@ if price is None:
 if not isinstance(price, dict):
     print(fallback); raise SystemExit(0)
 
+# The model's context window, when the config knows it. Claude Code reports 200k
+# for models it does not recognise as extended-context, which is wrong for a
+# gateway alias; the shell uses this to size the bar. Emitted here so the model
+# only has to be matched once.
+ctx_tokens = price.get("context_tokens")
+try:
+    ctx_tokens = int(ctx_tokens) if ctx_tokens else 0
+except (TypeError, ValueError):
+    ctx_tokens = 0
+
 
 # ── peak / off-peak tier ────────────────────────────────────────────────────
 # DeepSeek bills peak hours (UTC, Mon-Fri 01:00-04:00 and 06:00-10:00) at double
@@ -236,21 +246,16 @@ if fp != "0|0|0|0" and fp != last_fp:
         pass
 
 # If we have no accumulated usage yet, fall back to Claude's number.
-# The tier rides along after a "|" so the shell can label it; a bare number means
-# "no tier applies" (a flat catalogue price, or the fallback above).
+# Fields: <usd>|<peak|off_peak|>|<context tokens, when known>
 if total <= 0:
-    print(fallback)
+    print(f"{fallback}||{ctx_tokens or ''}")
 else:
-    print(f"{total:.8f}|{tier or ''}")
+    print(f"{total:.8f}|{tier or ''}|{ctx_tokens or ''}")
 PY
   )
   if [[ -n "$COST_CUSTOM" ]]; then
-    COST="${COST_CUSTOM%%|*}"
-    case "${COST_CUSTOM##*|}" in
-      peak)     COST_TIER="peak" ;;
-      off_peak) COST_TIER="off_peak" ;;
-      *)        COST_TIER="" ;;
-    esac
+    # <usd>|<tier>|<context tokens>; a bare number means neither was available
+    IFS='|' read -r COST COST_TIER COST_WINDOW <<< "$COST_CUSTOM"
   fi
 fi
 
@@ -321,15 +326,17 @@ DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")
 # FX updater can rewrite config.json mid-render — a single read is also a
 # consistent snapshot. The display toggle comes from the same read.
 CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""; CFG_SHOW_TIER=""
+CFG_CTX_WINDOW=""
 if [[ -f "$PET_CONFIG" ]]; then
-  IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL CFG_SHOW_TIER \
+  IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL CFG_SHOW_TIER CFG_CTX_WINDOW \
     <<< "$(jq -r '[
       (if .display == false then "false" else "true" end),
       (.currency.code // ""),
       (.currency.usd_rate // ""),
       (if .currency.show_usd == true then "1" else "" end),
       (.currency.symbol // ""),
-      (if .currency.show_tier == false then "0" else "" end)
+      (if .currency.show_tier == false then "0" else "" end),
+      (.context_window_tokens // "")
     ] | map(tostring) | join("\u001f")' "$PET_CONFIG" 2>/dev/null)"
 fi
 PET_DISPLAY="${CFG_DISPLAY:-true}"
@@ -375,6 +382,22 @@ LINES_FMT="+${LINES_ADD}/-${LINES_DEL}"
 
 # ── Plan detection (removed — not relevant for most users) ───────────────────
 PLAN=""
+
+# ── Context window size ──────────────────────────────────────────────────────
+# Claude Code reports 200000 for models it does not recognise as extended-context,
+# which understates a gateway model (deepseek-flash is 1M). Prefer an explicit
+# config value, then the limit configured for this model, and only use it when it
+# is larger than the payload's. When it wins, recompute the percentage with the
+# documented input-only formula so bar, % and numbers stay consistent.
+CTX_WINDOW="${CFG_CTX_WINDOW:-}"
+[[ "$CTX_WINDOW" =~ ^[0-9]+$ ]] || CTX_WINDOW=""
+if [[ -z "$CTX_WINDOW" && -n "${COST_WINDOW:-}" ]] && (( ${COST_WINDOW:-0} > ${CTX_SIZE:-0} )); then
+  CTX_WINDOW="$COST_WINDOW"
+fi
+if (( ${CTX_WINDOW:-0} > 0 )); then
+  CTX_SIZE="$CTX_WINDOW"
+  PCT=$(( ${CTX_USED:-0} * 100 / CTX_WINDOW ))
+fi
 
 # ── Context bar (10 chars) + numeric usage ───────────────────────────────────
 # ASCII #/- so terminals missing shade glyphs (▓/░) don't show �.

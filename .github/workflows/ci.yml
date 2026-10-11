@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # Community Edition：不需要 SEMGREP_APP_TOKEN。p/default 是精选规则。
+  # 全级别结果打在日志里；只有 ERROR 让检查失败。--metrics=off 避免把代码片段送去 Semgrep。
+  semgrep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.179.0
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep scan --config p/default --metrics=off
+      - run: semgrep scan --config p/default --metrics=off --severity ERROR --error

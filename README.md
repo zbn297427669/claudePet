@@ -109,6 +109,34 @@ Remove the `UserPromptSubmit` hook and `statusLine` entries from `~/.claude/sett
 
 </details>
 
+
+<details>
+<summary>Local currency (optional)</summary>
+
+Claude Code reports cost in USD. To show a local currency in the status line, set `~/.claude/claude-pet/config.json`:
+
+```json
+{
+  "display": true,
+  "currency": {
+    "code": "CNY",
+    "symbol": "¥",
+    "usd_rate": 7.2,
+    "show_usd": false
+  }
+}
+```
+
+`./install.sh` symlinks `update-fx-rate.sh` into `~/.claude/claude-pet/`. The status line refreshes the USD→local rate in the background when the cache is older than 24h (override with `PET_FX_TTL_HOURS`, disable with `PET_FX_UPDATE=0`).
+
+Manual refresh:
+
+```bash
+~/.claude/claude-pet/update-fx-rate.sh --force
+```
+
+</details>
+
 <details>
 <summary>Data files</summary>
 
@@ -116,7 +144,7 @@ Pet state persists in `~/.claude/claude-pet/`:
 - `state.json` — XP, level, streaks, milestones, assigned family
 - `sprites.json` — block-art creature sprites
 - `creatures.json` — creature registry
-- `config.json` — display toggle
+- `config.json` — display toggle and optional `currency` settings
 - `prompt-history.json` — last 50 scored prompts
 
 </details>

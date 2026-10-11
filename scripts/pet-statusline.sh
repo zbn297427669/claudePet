@@ -11,6 +11,12 @@
 
 input=$(cat)
 
+# Refresh FX in background if cache stale (non-blocking)
+FX_UPDATER="${PET_FX_UPDATE_SCRIPT:-$HOME/.claude/claude-pet/update-fx-rate.sh}"
+if [[ "${PET_FX_UPDATE:-1}" != "0" && -x "$FX_UPDATER" ]]; then
+  "$FX_UPDATER" >/dev/null 2>&1 &
+fi
+
 # ── Parse JSON ───────────────────────────────────────────────────────────────
 # Claude Code statusline protocol: https://code.claude.com/docs/en/statusline
 MODEL=$(echo "$input"    | jq -r '.model.display_name // "Claude"')
@@ -65,7 +71,38 @@ GIT_DIR="${DIR/#\~/$HOME}"
 BRANCH=$(git -C "$GIT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
 # ── Cost / duration / lines ──────────────────────────────────────────────────
-COST_FMT=$(printf '$%.4f' "$COST")
+# Currency: Claude reports USD. Optional FX via env or ~/.claude/claude-pet/config.json:
+#   env:  PET_COST_CURRENCY=CNY  PET_USD_RATE=7.2  PET_COST_SHOW_USD=1
+#   json: "currency": { "code":"CNY", "symbol":"¥", "usd_rate":7.2, "show_usd":false }
+PET_CONFIG_EARLY="$HOME/.claude/claude-pet/config.json"
+COST_CURRENCY="${PET_COST_CURRENCY:-}"
+USD_RATE="${PET_USD_RATE:-}"
+COST_SHOW_USD="${PET_COST_SHOW_USD:-}"
+COST_SYMBOL=""
+if [ -f "$PET_CONFIG_EARLY" ]; then
+  [ -z "$COST_CURRENCY" ] && COST_CURRENCY=$(jq -r '.currency.code // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
+  [ -z "$USD_RATE" ] && USD_RATE=$(jq -r '.currency.usd_rate // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
+  [ -z "$COST_SHOW_USD" ] && COST_SHOW_USD=$(jq -r 'if .currency.show_usd == true then "1" else empty end' "$PET_CONFIG_EARLY" 2>/dev/null)
+  COST_SYMBOL=$(jq -r '.currency.symbol // empty' "$PET_CONFIG_EARLY" 2>/dev/null)
+fi
+COST_CURRENCY="${COST_CURRENCY:-USD}"
+USD_RATE="${USD_RATE:-1}"
+COST_SHOW_USD="${COST_SHOW_USD:-0}"
+case "$COST_CURRENCY" in
+  CNY|RMB|cny|rmb) COST_SYMBOL="${COST_SYMBOL:-¥}"; COST_CURRENCY="CNY" ;;
+  USD|usd|"") COST_SYMBOL="${COST_SYMBOL:-\$}"; COST_CURRENCY="USD"; USD_RATE=1 ;;
+  *) COST_SYMBOL="${COST_SYMBOL:-$COST_CURRENCY }" ;;
+esac
+if [ "$COST_CURRENCY" = "USD" ] || [ "$USD_RATE" = "1" ] || [ -z "$USD_RATE" ]; then
+  COST_FMT=$(printf '%s%.4f' "$COST_SYMBOL" "$COST")
+else
+  COST_LOCAL=$(awk -v c="$COST" -v r="$USD_RATE" 'BEGIN{printf "%.4f", c*r}')
+  if [ "$COST_SHOW_USD" = "1" ]; then
+    COST_FMT=$(printf '%s%s (~$%.4f)' "$COST_SYMBOL" "$COST_LOCAL" "$COST")
+  else
+    COST_FMT=$(printf '%s%s' "$COST_SYMBOL" "$COST_LOCAL")
+  fi
+fi
 DUR_S=$(( ${DUR_MS:-0} / 1000 ))
 if [ "$DUR_S" -ge 3600 ]; then
   DUR_FMT=$(printf '%dh%02dm' $((DUR_S/3600)) $(((DUR_S%3600)/60)))
@@ -118,7 +155,7 @@ SEP="${DIM} │ ${RST}"
 
 # ── Assemble status bar ──────────────────────────────────────────────────────
 # Example:
-#   ⬡ model │ ~/path │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ $0.01 │ 3m12s │ +12/-3
+#   ⬡ model │ ~/path │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
 L=""
 [ -n "$PLAN" ] && L="${GRAY}${PLAN}${RST}${SEP}"
 L="${L}${GRAY}⬡ ${MODEL}${RST}"

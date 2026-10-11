@@ -25,6 +25,7 @@ Then restart Claude Code. Your pet appears in the status line.
 ## What You Get
 
 - **Pixel creature** in your status line that evolves through 5 stages
+- **Richer status line metrics** — ASCII context bar with used/size tokens, cache hit rate (`cache 99% · 207k`), output tokens, session duration, and lines changed
 - **Prompt scoring** across 5 dimensions (specificity, context, actionability, scope, constraints)
 - **XP system** — better prompts = more XP = faster evolution
 - **9 creature families** — randomly assigned, each with unique personality and voice

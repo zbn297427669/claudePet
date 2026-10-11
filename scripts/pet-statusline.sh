@@ -12,11 +12,42 @@
 input=$(cat)
 
 # ── Parse JSON ───────────────────────────────────────────────────────────────
+# Claude Code statusline protocol: https://code.claude.com/docs/en/statusline
 MODEL=$(echo "$input"    | jq -r '.model.display_name // "Claude"')
 DIR=$(echo "$input"      | jq -r '.workspace.current_dir // .cwd // ""')
 PCT=$(echo "$input"      | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
-COST=$(echo "$input"     | jq -r '.cost.total_cost_usd // 0')
+CTX_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
+# Prefer live current_usage (input+cache); fallback to total_input_tokens
+CTX_USED=$(echo "$input" | jq -r '
+  def n(x): (x // 0);
+  if (.context_window.current_usage != null) then
+    n(.context_window.current_usage.input_tokens)
+    + n(.context_window.current_usage.cache_creation_input_tokens)
+    + n(.context_window.current_usage.cache_read_input_tokens)
+  else
+    n(.context_window.total_input_tokens)
+  end
+')
+CACHE_READ=$(echo "$input"   | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+OUT_TOK=$(echo "$input"      | jq -r '.context_window.total_output_tokens // .context_window.current_usage.output_tokens // 0')
+USAGE_IN=$(echo "$input"     | jq -r '.context_window.current_usage.input_tokens // 0')
+USAGE_CC=$(echo "$input"     | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
+USAGE_CR=$(echo "$input"     | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+COST=$(echo "$input"         | jq -r '.cost.total_cost_usd // 0')
+DUR_MS=$(echo "$input"       | jq -r '.cost.total_duration_ms // 0')
+LINES_ADD=$(echo "$input"    | jq -r '.cost.total_lines_added // 0')
+LINES_DEL=$(echo "$input"    | jq -r '.cost.total_lines_removed // 0')
 
+fmt_tokens() {
+  # 15500 -> 15.5k, 200000 -> 200k, 1000000 -> 1.0M
+  local n="${1:-0}"
+  awk -v n="$n" 'BEGIN{
+    n+=0
+    if (n>=1000000) printf "%.1fM", n/1000000
+    else if (n>=1000) printf "%.1fk", n/1000
+    else printf "%d", n
+  }'
+}
 
 # ── Dir: shorten to ~/parent/dir ─────────────────────────────────────────────
 DIR="${DIR/#$HOME/~}"
@@ -33,21 +64,50 @@ fi
 GIT_DIR="${DIR/#\~/$HOME}"
 BRANCH=$(git -C "$GIT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
-# ── Cost ─────────────────────────────────────────────────────────────────────
+# ── Cost / duration / lines ──────────────────────────────────────────────────
 COST_FMT=$(printf '$%.4f' "$COST")
+DUR_S=$(( ${DUR_MS:-0} / 1000 ))
+if [ "$DUR_S" -ge 3600 ]; then
+  DUR_FMT=$(printf '%dh%02dm' $((DUR_S/3600)) $(((DUR_S%3600)/60)))
+elif [ "$DUR_S" -ge 60 ]; then
+  DUR_FMT=$(printf '%dm%02ds' $((DUR_S/60)) $((DUR_S%60)))
+else
+  DUR_FMT="${DUR_S}s"
+fi
+LINES_FMT="+${LINES_ADD}/-${LINES_DEL}"
 
 # ── Plan detection (removed — not relevant for most users) ───────────────────
 PLAN=""
 
-# ── Context bar (15 chars wide) ──────────────────────────────────────────────
+# ── Context bar (10 chars) + numeric usage ───────────────────────────────────
+# ASCII #/- so terminals missing shade glyphs (▓/░) don't show mojibake.
 [ -z "$PCT" ] && PCT=0
-BAR_W=15
+BAR_W=10
 FILLED=$((PCT * BAR_W / 100))
 [ "$FILLED" -gt "$BAR_W" ] && FILLED=$BAR_W
 EMPTY=$((BAR_W - FILLED))
 BAR=""
-[ "$FILLED" -gt 0 ] && BAR=$(printf "%${FILLED}s" | tr ' ' '▓')
-[ "$EMPTY"  -gt 0 ] && BAR="${BAR}$(printf "%${EMPTY}s" | tr ' ' '░')"
+[ "$FILLED" -gt 0 ] && BAR=$(printf "%${FILLED}s" | tr ' ' '#')
+[ "$EMPTY"  -gt 0 ] && BAR="${BAR}$(printf "%${EMPTY}s" | tr ' ' '-')"
+BAR="[${BAR}]"
+USED_FMT=$(fmt_tokens "$CTX_USED")
+SIZE_FMT=$(fmt_tokens "$CTX_SIZE")
+CTX_NUM="${USED_FMT}/${SIZE_FMT}"
+CACHE_FMT=$(fmt_tokens "$CACHE_READ")
+OUT_FMT=$(fmt_tokens "$OUT_TOK")
+# Cache hit rate = cache_read / (input + cache_write + cache_read)
+# Show % first (intuition), then volume (scale):  cache 99% · 207k
+CACHE_DENOM=$(awk -v a="${USAGE_IN:-0}" -v b="${USAGE_CC:-0}" -v c="${USAGE_CR:-0}" 'BEGIN{printf "%d", a+b+c}')
+CACHE_SEG=""
+if [ "${CACHE_DENOM:-0}" -gt 0 ] 2>/dev/null; then
+  CACHE_HIT=$(awk -v r="${USAGE_CR:-0}" -v d="$CACHE_DENOM" 'BEGIN{printf "%d", (r*100)/d}')
+  [ "$CACHE_HIT" -gt 100 ] && CACHE_HIT=100
+  if [ "${USAGE_CR:-0}" != "0" ]; then
+    CACHE_SEG="cache ${CACHE_HIT}% · ${CACHE_FMT}"
+  else
+    CACHE_SEG="cache 0%"
+  fi
+fi
 BAR_CLR="\033[38;5;245m"
 
 # ── ANSI palette ─────────────────────────────────────────────────────────────
@@ -57,13 +117,21 @@ DIM="\033[38;5;238m"
 SEP="${DIM} │ ${RST}"
 
 # ── Assemble status bar ──────────────────────────────────────────────────────
+# Example:
+#   ⬡ model │ ~/path │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ $0.01 │ 3m12s │ +12/-3
 L=""
 [ -n "$PLAN" ] && L="${GRAY}${PLAN}${RST}${SEP}"
 L="${L}${GRAY}⬡ ${MODEL}${RST}"
 L="${L}${SEP}${GRAY}${DIR_DISPLAY}${RST}"
 [ -n "$BRANCH" ] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}"
-L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}%${RST}"
+L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}% ${CTX_NUM}${RST}"
+[ -n "$CACHE_SEG" ] && L="${L}${SEP}${GRAY}${CACHE_SEG}${RST}"
+[ "${OUT_TOK:-0}" != "0" ] && L="${L}${SEP}${GRAY}out ${OUT_FMT}${RST}"
 L="${L}${SEP}${GRAY}${COST_FMT}${RST}"
+[ "${DUR_MS:-0}" != "0" ] && L="${L}${SEP}${GRAY}${DUR_FMT}${RST}"
+if [ "${LINES_ADD:-0}" != "0" ] || [ "${LINES_DEL:-0}" != "0" ]; then
+  L="${L}${SEP}${GRAY}${LINES_FMT}${RST}"
+fi
 
 # ── Pet Buddy (monstapix block art) ──────────────────────────────────────────
 PET_DIR="$HOME/.claude/claude-pet"

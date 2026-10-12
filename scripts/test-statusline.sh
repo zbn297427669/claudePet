@@ -284,6 +284,45 @@ peak_cfg '.peak_alert.countdown = false | .peak_alert.show_premium = false'
 check "countdown and premium can be switched off" \
   "$(count_in '^⚡峰 │' "$(peak_render "$MON_PEAK" 30000000)")" "1"
 
+# ── information segments (info.show / info.hide) ─────────────────────────────
+# info.show is the master switch for the metrics bar; info.hide drops segments
+# while it is on. model is deliberately NOT hideable, so the bar cannot end up
+# blank by accident.
+INFO_BASE='{"display":true,"currency":{"code":"CNY","symbol":"¥","usd_rate":6.70036411},
+  "pricing":{"models":{"deepseek-flash":{"context_tokens":1000000,
+    "off_peak":{"input_per_mtok":0.15,"output_per_mtok":0.6,"cache_read_per_mtok":0.003},
+    "peak":{"input_per_mtok":0.3,"output_per_mtok":1.2,"cache_read_per_mtok":0.006}}}}}'
+INFO_PAYLOAD='{"model":{"display_name":"deepseek-flash","id":"deepseek-flash"},"session_id":"i","workspace":{"current_dir":"/home/ada/projects/github/AI/claude/claudePet"},"context_window":{"used_percentage":21.7,"context_window_size":200000,"current_usage":{"input_tokens":120,"cache_creation_input_tokens":800,"cache_read_input_tokens":41180,"output_tokens":1234}},"cost":{"total_cost_usd":0.01234,"total_duration_ms":192000,"total_lines_added":12,"total_lines_removed":3}}'
+
+info_render() { # $1 = config JSON
+  printf '%s' "$1" > "$PET_DIR/config.json"
+  rm -f "$PET_DIR/cost-state.json"
+  HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_NOW_UTC=2026-10-12T05:00:00Z \
+    bash "$SL" <<< "$INFO_PAYLOAD" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+bar="$(info_render "$INFO_BASE")"
+check "default draws every conditional segment" \
+  "$(count_in 'cache 97%' "$bar")" "1"
+check "default draws duration and lines" \
+  "$(( $(count_in '3m12s' "$bar") + $(count_in '+12/-3' "$bar") ))" "2"
+
+bar="$(info_render "$(jq -c '.info = {hide: ["cache","out","duration","lines"]}' <<< "$INFO_BASE")")"
+check "hide drops the named segments"  "$(( $(count_in 'cache 97%' "$bar") + $(count_in '3m12s' "$bar") + $(count_in '+12/-3' "$bar") ))" "0"
+check "hide keeps the others"          "$(count_in '⬡ deepseek-flash' "$bar")" "1"
+# the card says 1M, so 42.1k of context is 4% — the window override at work
+check "hide keeps the context bar"     "$(count_in '4% 42.1k/1.0M' "$bar")" "1"
+
+bar="$(info_render "$(jq -c '.info = {hide: ["model"]}' <<< "$INFO_BASE")")"
+check "model is not hideable"          "$(count_in '⬡ deepseek-flash' "$bar")" "1"
+
+bar="$(info_render "$(jq -c '.info = {show: false}' <<< "$INFO_BASE")")"
+check "info.show=false drops the bar entirely" "$(count_in '⬡ deepseek-flash' "$bar")" "0"
+check "info.show=false keeps the pet"  "$(count_in 'Pet: ◆' "$bar")" "1"
+
+out="$(info_render "$(jq -c '.display = false | .info = {show: false}' <<< "$INFO_BASE")")"
+check "both switches off print nothing at all" "${#out}" "0"
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

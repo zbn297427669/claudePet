@@ -4,44 +4,38 @@ description: Toggle pet display on/off, check status, or reset. Usage - /pet on,
 user_invocable: true
 ---
 
-# Pet Display Toggle
+# Pet display and status
 
-The user wants to control their pet buddy display. Parse their argument:
+The logic lives in the installed helper, `~/.claude/claude-pet/pet-toggle.sh`.
+It merges `config.json` instead of overwriting it — turning the pet off must not
+delete the currency, pricing or peak-alert settings — and it is covered by
+`scripts/test-pet-toggle.sh`. Do not inline those file writes here again: an
+`echo '{...}' > config.json` in this file is what caused that bug.
 
-- **`/pet on`** or **`/pet`** (no args): Turn display ON
-- **`/pet off`**: Turn display OFF  
-- **`/pet status`**: Show current pet info
-- **`/pet reset`**: Reset pet to stage 1 with a random new family
+Map the argument to an action and run it:
 
-## Actions
+| Argument | Run |
+|---|---|
+| `on`, or none | `~/.claude/claude-pet/pet-toggle.sh on` |
+| `off` | `~/.claude/claude-pet/pet-toggle.sh off` |
+| `status` | `~/.claude/claude-pet/pet-toggle.sh status` |
+| `reset` | `~/.claude/claude-pet/pet-toggle.sh reset` |
+| `info on` / `info off` | `~/.claude/claude-pet/pet-toggle.sh info on` / `... info off` |
+| `info hide a,b` | `~/.claude/claude-pet/pet-toggle.sh info hide a,b` |
+| `info unhide a,b` | `~/.claude/claude-pet/pet-toggle.sh info unhide a,b` |
+| `info` | `~/.claude/claude-pet/pet-toggle.sh info status` |
+| anything else | run `... info status`, and mention the valid arguments |
 
-### Turn ON
-Run this command:
-```bash
-echo '{"display": true}' > ~/.claude/claude-pet/config.json
-```
-Then respond: "Pet display turned ON."
+`on`/`off` are about the **creature**; `info` is about the **metrics bar** (model,
+directory, branch, context bar, cache, output, cost, duration, lines changed).
+They are independent, so "hide the pet but keep the numbers" is `off` alone.
+`hide`/`unhide` take comma-separated segment names, and `info hide` with no names
+shows every segment again. The `model` segment is deliberately not hideable — it
+is the identity of the line — so use `info off` to hide the whole bar.
 
-### Turn OFF
-Run this command:
-```bash
-echo '{"display": false}' > ~/.claude/claude-pet/config.json
-```
-Then respond: "Pet display turned OFF."
+Then show the command's output to the user as it is — it already contains the
+sentence to reply with (for `reset`, the family and stage it picked).
 
-### Status
-Read `~/.claude/claude-pet/state.json` and report the pet's current stage, XP, streak, and milestones. Also mention whether display is currently on or off by reading `~/.claude/claude-pet/config.json`.
-
-### Reset
-Run this command to pick a random family and reset:
-```bash
-FAMILIES=(titan swarm golem invader crawler brute phantom aberrant raptor)
-RANDOM_FAMILY=${FAMILIES[$((RANDOM % ${#FAMILIES[@]}))]}
-STAGE_NAME=$(jq -r ".evolutionLines.\"$RANDOM_FAMILY\".stages[0].name" ~/.claude/claude-pet/creatures.json)
-cat > ~/.claude/claude-pet/state.json << STATE
-{"currentLineId":"$RANDOM_FAMILY","currentStageIndex":0,"xp":0,"totalPromptsScored":0,"streakDays":0,"lastActiveDate":"","milestonesCompleted":[],"evolutionHistory":[]}
-STATE
-rm -f ~/.claude/claude-pet/last-activity.json
-echo "$RANDOM_FAMILY $STAGE_NAME"
-```
-Read the output to get the assigned family and stage name. Then respond: "Pet reset! You got a **[stage name]** from the **[family]** line. Start fresh!"
+If the helper is missing (the checkout was moved or deleted), tell the user to
+re-run `./install.sh` from the claudePet checkout rather than writing the files
+by hand.

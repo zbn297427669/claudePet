@@ -64,9 +64,32 @@ Each prompt is scored 0-20 per dimension (max 100 total):
 ## Commands
 
 - `/pet on` — show pet in status line
-- `/pet off` — hide pet
-- `/pet status` — check XP, level, streak
+- `/pet off` — hide pet (the metrics bar stays)
+- `/pet status` — check XP, level, streak, display state
 - `/pet reset` — reset with a random new family
+- `/pet info off` — hide the whole metrics bar (pet unaffected)
+- `/pet info on` — show it again
+- `/pet info hide cache,out,duration` — drop single segments, keep the rest
+- `/pet info unhide cache` — bring one back; `/pet info hide` with no names resets to everything
+- `/pet info` — report what is shown and hidden
+
+The pet and the information are independent switches: `/pet off` hides the
+creature only, `/pet info off` hides the numbers only, and both off prints
+nothing at all — which leaves **one empty status line row**, because Claude Code
+reserves that region for whatever the configured statusLine command prints. That
+blank row is the interface's, not the script's: reclaiming it means removing the
+`statusLine` setting rather than hiding more segments. Segments you can hide are `model dir branch context cache out
+cost duration lines`; `model` is deliberately not hideable — it is the identity
+of the line — so hiding everything is `/pet info off` rather than a long list.
+Hiding the bar does **not** stop the cost estimate accumulating, so switching it
+back on shows the session's running total instead of a fresh zero.
+
+The same settings live in `config.json` for hand-editing, and are re-read every
+render:
+
+```json
+{ "display": true, "info": { "show": true, "hide": ["cache", "out"] } }
+```
 
 ## Requirements
 
@@ -235,7 +258,7 @@ Pet state persists in `~/.claude/claude-pet/`:
 ```bash
 npm test              # unit tests (jest) + script tests (bash)
 npm run test:unit     # jest only
-npm run test:scripts  # status line + pricing updater, no jest, temp $HOME, no network
+npm run test:scripts  # status line, pricing updater, cost audit, /pet toggle — no jest, temp $HOME, no network
 npm run build         # tsc + copy data/ into dist/
 ```
 

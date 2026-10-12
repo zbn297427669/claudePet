@@ -414,9 +414,11 @@ DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")
 # consistent snapshot. The display toggle comes from the same read.
 CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""; CFG_SHOW_TIER=""
 CFG_CTX_WINDOW=""; CFG_PK_ENABLED=""; CFG_PK_COUNTDOWN=""; CFG_PK_PREWARN=""; CFG_PK_THRESHOLD=""; CFG_PK_PREMIUM=""
+CFG_INFO_SHOW=""; CFG_INFO_HIDE=""
 if [[ -f "$PET_CONFIG" ]]; then
   IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL CFG_SHOW_TIER CFG_CTX_WINDOW \
     CFG_PK_ENABLED CFG_PK_COUNTDOWN CFG_PK_PREWARN CFG_PK_THRESHOLD CFG_PK_PREMIUM \
+    CFG_INFO_SHOW CFG_INFO_HIDE \
     <<< "$(jq -r '[
       (if .display == false then "false" else "true" end),
       (.currency.code // ""),
@@ -429,11 +431,30 @@ if [[ -f "$PET_CONFIG" ]]; then
       (if .peak_alert.countdown == false then "0" else "1" end),
       (.peak_alert.pre_warn_minutes // ""),
       (.peak_alert.cost_threshold // ""),
-      (if .peak_alert.show_premium == false then "0" else "1" end)
+      (if .peak_alert.show_premium == false then "0" else "1" end),
+      (if .info.show == false then "0" else "1" end),
+      ((.info.hide // []) | map(select(type == "string")) | join(","))
     ] | map(tostring) | join("\u001f")' "$PET_CONFIG" 2>/dev/null)"
 fi
 PET_DISPLAY="${CFG_DISPLAY:-true}"
 SHOW_TIER="${PET_COST_TIER_LABEL:-${CFG_SHOW_TIER:-1}}"
+
+# ── Which information segments to draw ───────────────────────────────────────
+# info.show is the master switch for the whole metrics bar; info.hide drops
+# individual segments while it is on. `model` is deliberately not hideable — it
+# is the line's identity, so the bar cannot end up blank by accident. To hide
+# everything, use info.show: false. Side effect worth knowing: the cost estimate
+# keeps running while the bar is hidden, so switching it back on shows a correct
+# running total instead of a fresh zero.
+INFO_SHOW="${PET_INFO_SHOW:-${CFG_INFO_SHOW:-1}}"
+INFO_HIDE=",${PET_INFO_HIDE:-${CFG_INFO_HIDE:-}},"
+
+seg_on() { # $1 = segment name
+  [[ "$INFO_SHOW" != "0" ]] || return 1
+  [[ "$1" == "model" ]] && return 0
+  [[ "$INFO_HIDE" == *",$1,"* ]] && return 1
+  return 0
+}
 # Peak-tariff alert settings (see README). Re-read every render, so editing
 # config.json takes effect on the next one — thresholds included.
 PK_ENABLED="${PET_PEAK_ALERT:-${CFG_PK_ENABLED:-1}}"
@@ -488,9 +509,6 @@ else
   DUR_FMT="${DUR_S}s"
 fi
 LINES_FMT="+${LINES_ADD}/-${LINES_DEL}"
-
-# ── Plan detection (removed — not relevant for most users) ───────────────────
-PLAN=""
 
 # ── Context window size ──────────────────────────────────────────────────────
 # Claude Code reports 200000 for models it does not recognise as extended-context,
@@ -552,7 +570,7 @@ SEP="${DIM} │ ${RST}"
 # actionable half — it is the moment to decide whether to wait.
 PK_PREFIX=""
 AMBER="\033[1;38;5;214m"
-if [[ "$PK_ENABLED" != "0" ]]; then
+if [[ "$PK_ENABLED" != "0" && "$INFO_SHOW" != "0" ]]; then
   if (( PK_LOUD )); then
     PK_PREFIX="${AMBER}⚡峰"
     if [[ "$PK_COUNTDOWN" != "0" ]] && (( ${COST_SECS:-0} > 0 )); then
@@ -573,17 +591,17 @@ fi
 # ── Assemble status bar ──────────────────────────────────────────────────────
 # Example:
 #   ⬡ model │ claudePet │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
+# Each segment is gated by seg_on, so info.hide can drop any of them but model.
 L="$PK_PREFIX"
-[[ -n "$PLAN" ]] && L="${GRAY}${PLAN}${RST}${SEP}"
-L="${L}${GRAY}⬡ ${MODEL}${RST}"
-L="${L}${SEP}${GRAY}${DIR_DISPLAY}${RST}"
-[[ -n "$BRANCH" ]] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}"
-L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}% ${CTX_NUM}${RST}"
-[[ -n "$CACHE_SEG" ]] && L="${L}${SEP}${GRAY}${CACHE_SEG}${RST}"
-[[ "${OUT_TOK:-0}" != "0" ]] && L="${L}${SEP}${GRAY}out ${OUT_FMT}${RST}"
-L="${L}${SEP}${GRAY}${COST_FMT}${RST}"
-[[ "${DUR_MS:-0}" != "0" ]] && L="${L}${SEP}${GRAY}${DUR_FMT}${RST}"
-if [[ "${LINES_ADD:-0}" != "0" ]] || [[ "${LINES_DEL:-0}" != "0" ]]; then
+seg_on model    && L="${L}${GRAY}⬡ ${MODEL}${RST}"
+seg_on dir      && L="${L}${SEP}${GRAY}${DIR_DISPLAY}${RST}"
+seg_on branch   && [[ -n "$BRANCH" ]] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}"
+seg_on context  && L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}% ${CTX_NUM}${RST}"
+seg_on cache    && [[ -n "$CACHE_SEG" ]] && L="${L}${SEP}${GRAY}${CACHE_SEG}${RST}"
+seg_on out      && [[ "${OUT_TOK:-0}" != "0" ]] && L="${L}${SEP}${GRAY}out ${OUT_FMT}${RST}"
+seg_on cost     && L="${L}${SEP}${GRAY}${COST_FMT}${RST}"
+seg_on duration && [[ "${DUR_MS:-0}" != "0" ]] && L="${L}${SEP}${GRAY}${DUR_FMT}${RST}"
+if seg_on lines && { [[ "${LINES_ADD:-0}" != "0" ]] || [[ "${LINES_DEL:-0}" != "0" ]]; }; then
   L="${L}${SEP}${GRAY}${LINES_FMT}${RST}"
 fi
 
@@ -651,6 +669,11 @@ if [[ "$PET_DISPLAY" = "true" ]] && [[ -f "$PET_STATE" ]] && [[ -f "$PET_SPRITES
   fi
 fi
 
-# Always print the metrics bar: /pet off hides the creature, not the status line,
-# and a missing state/sprites file must not blank it either.
-printf "%b\n" "$L"
+# Print the bar unless the information is switched off (info.show: false). A
+# missing state/sprites file must still not blank it — that is what the
+# pet-display branch used to get wrong. Printing nothing here with both switches
+# off leaves an empty status line row (observed): Claude Code reserves that
+# region, so it is not something this script can take back.
+if [[ -n "$L" ]]; then
+  printf "%b\n" "$L"
+fi

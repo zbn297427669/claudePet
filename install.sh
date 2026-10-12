@@ -43,9 +43,11 @@ echo "  Done."
 echo "[3/5] Setting up pet data..."
 mkdir -p "$PET_DATA_DIR"
 
-# Copy data files (sprites + creatures for statusline)
-cp "$SCRIPT_DIR/src/data/sprites.json" "$PET_DATA_DIR/sprites.json"
-cp "$SCRIPT_DIR/src/data/creatures.json" "$PET_DATA_DIR/creatures.json"
+# Link data files (sprites + creatures for statusline). Symlink rather than copy:
+# the status line reads these while the engine reads dist/data, and copies drift
+# the moment either side is regenerated.
+ln -sfn "$SCRIPT_DIR/src/data/sprites.json" "$PET_DATA_DIR/sprites.json"
+ln -sfn "$SCRIPT_DIR/src/data/creatures.json" "$PET_DATA_DIR/creatures.json"
 
 # Create default state if none exists — random family assignment
 if [ ! -f "$PET_DATA_DIR/state.json" ]; then
@@ -77,12 +79,18 @@ if [ ! -f "$PET_DATA_DIR/config.json" ]; then
   echo '{"display": true}' > "$PET_DATA_DIR/config.json"
 fi
 
-# Install /pet skill globally
-mkdir -p "$HOME/.claude/skills/pet"
-if cp "$SCRIPT_DIR/skills/pet/SKILL.md" "$HOME/.claude/skills/pet/SKILL.md" 2>/dev/null; then
+# Install /pet skill globally. Link the directory, not the file: the docs cover a
+# <skill-name> entry being a symlink to a directory elsewhere, and this keeps the
+# installed skill current with the checkout — a copied SKILL.md went stale and
+# kept a destructive `echo > config.json` around after it was fixed here.
+mkdir -p "$HOME/.claude/skills"
+if [[ -e "$HOME/.claude/skills/pet" && ! -L "$HOME/.claude/skills/pet" ]]; then
+  rm -rf "$HOME/.claude/skills/pet"   # an older install copied SKILL.md into a real dir
+fi
+if ln -sfn "$SCRIPT_DIR/skills/pet" "$HOME/.claude/skills/pet" 2>/dev/null; then
   echo "  /pet command installed."
 else
-  echo "  Warning: Could not install /pet command. Copy skills/pet/SKILL.md to ~/.claude/skills/pet/ manually."
+  echo "  Warning: Could not install /pet command. Copy skills/pet/ to ~/.claude/skills/pet/ manually."
 fi
 # Optional FX updater used by statusline (TTL-cached)
 if [[ -f "$SCRIPT_DIR/scripts/update-fx-rate.sh" ]]; then
@@ -90,6 +98,11 @@ if [[ -f "$SCRIPT_DIR/scripts/update-fx-rate.sh" ]]; then
 fi
 if [[ -f "$SCRIPT_DIR/scripts/update-model-pricing.sh" ]]; then
   ln -sfn "$SCRIPT_DIR/scripts/update-model-pricing.sh" "$PET_DATA_DIR/update-model-pricing.sh"
+fi
+# The /pet skill calls this at a stable path, so it keeps working after a repo
+# change without reinstalling the skill
+if [[ -f "$SCRIPT_DIR/scripts/pet-toggle.sh" ]]; then
+  ln -sfn "$SCRIPT_DIR/scripts/pet-toggle.sh" "$PET_DATA_DIR/pet-toggle.sh"
 fi
 
 echo "  Data files ready."

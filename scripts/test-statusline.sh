@@ -98,8 +98,11 @@ cost_payload() { # $1 = model id
 cost_render() { # $1=config json  $2=model  $3=PET_NOW_UTC  $4=extra env
   printf '%s' "$1" > "$PET_DIR/config.json"
   rm -f "$PET_DIR/cost-state.json"     # each case starts a fresh accumulator
+  # env, not a bare ${4:-}: bash only treats assignment words written literally
+  # in the source as assignments, so an expanded one becomes the command name
+  # and the render fails — which a "must NOT contain" assertion cannot see.
   HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
-    PET_NOW_UTC="$3" ${4:-} \
+    PET_NOW_UTC="$3" env ${4:-} \
     bash "$SL" <<< "$(cost_payload "${2:-deepseek-flash}")" 2>/dev/null \
     | sed 's/\x1b\[[0-9;]*m//g'
 }
@@ -223,6 +226,199 @@ Path(sys.argv[1]).write_text(json.dumps({"sessions": {
 PY
 sess_render "$FLAT1" NEW 1 >/dev/null
 check "the session map is capped"             "$(jq '.sessions | length' "$PET_DIR/cost-state.json")" "20"
+
+# ── output rate ──────────────────────────────────────────────────────────────
+# tok/s = output tokens from the transcript / the API time those responses
+# actually took, both taken from the same request→response pairs. The numerator
+# cannot come from current_usage.output_tokens: that only describes the last
+# response, so sampling it every 30s loses the ones in between — measured 4x low
+# in a tool-calling turn. The denominator cannot come from the payload's
+# total_api_duration_ms, which keeps counting time for history a compaction has
+# dropped. Four traps get a case each: the rate must not fall over when the
+# model has no price match (that path exits early), it must not be disabled
+# along with the priced estimate, a response recorded twice must not be counted
+# twice, and a transcript whose responses cannot be paired must not be rescanned
+# from the top on every render.
+RATE_CONFIG='{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{"models":{
+  "m":{"input_per_mtok":1,"output_per_mtok":2,"cache_read_per_mtok":0.1}}}}'
+
+# Echoed payloads use cwd /tmp/pet, so Claude Code's project dir is -tmp-pet.
+TRANSCRIPTS="$TMP/claude-config/projects/-tmp-pet"
+mkdir -p "$TRANSCRIPTS"
+
+add_response() { # $1=session $2=message id $3=output tokens [$4=timestamp]
+  if [[ -n "${4:-}" ]]; then
+    jq -cn --arg id "$2" --argjson out "$3" --arg ts "$4" \
+      '{type:"assistant",timestamp:$ts,message:{id:$id,usage:{output_tokens:$out}}}' \
+      >> "$TRANSCRIPTS/$1.jsonl"
+  else
+    jq -cn --arg id "$2" --argjson out "$3" \
+      '{type:"assistant",message:{id:$id,usage:{output_tokens:$out}}}' \
+      >> "$TRANSCRIPTS/$1.jsonl"
+  fi
+}
+
+add_request() { # $1=session $2=request id $3=timestamp
+  jq -cn --arg id "$2" --arg ts "$3" \
+    '{type:"api-request",id:$id,timestamp:$ts}' >> "$TRANSCRIPTS/$1.jsonl"
+}
+
+add_pair() { # $1=session $2=request id $3=message id $4=out tokens $5=req ts $6=resp ts
+  add_request "$1" "$2" "$5"
+  jq -cn --arg id "$3" --argjson out "$4" --arg ts "$6" --arg ref "$2" \
+    '{type:"assistant",requestRef:$ref,timestamp:$ts,
+      message:{id:$id,usage:{output_tokens:$out}}}' >> "$TRANSCRIPTS/$1.jsonl"
+}
+
+rate_payload() { # $1=session $2=api ms
+  printf '{"model":{"display_name":"m","id":"m"},"session_id":"%s",' "$1"
+  printf '"workspace":{"current_dir":"/tmp/pet"},"context_window":{"used_percentage":10,'
+  printf '"context_window_size":200000,"current_usage":{"input_tokens":0,'
+  printf '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}},'
+  printf '"cost":{"total_cost_usd":1,"total_api_duration_ms":%s}}' "$2"
+}
+
+rate_run() { # $1=config $2=session $3=api ms $4=extra env
+  printf '%s' "$1" > "$PET_DIR/config.json"
+  # env, not a bare ${4:-}: bash only treats assignment words written literally
+  # in the source as assignments, so an expanded one becomes the command name.
+  HOME="$TMP" CLAUDE_CONFIG_DIR="$TMP/claude-config" \
+    PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+    env ${4:-} \
+    bash "$SL" <<< "$(rate_payload "$2" "$3")" 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+rate_of() { grep -o '[0-9.]* tok/s' <<< "$1" | head -1; }
+
+rm -f "$PET_DIR/cost-state.json" "$TRANSCRIPTS"/*.jsonl
+nocheck "no rate before any API time is reported" "$(rate_run "$RATE_CONFIG" R 0)" "tok/s"
+nocheck "no rate without a transcript"            "$(rate_run "$RATE_CONFIG" R 1000)" "tok/s"
+
+add_pair R q1 r1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'   # 100 tok / 1s
+check "rate is output tokens per API second" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" R 1000)")" "100.0 tok/s"
+
+add_pair R q2 r2 200 '2026-10-20T00:00:02Z' '2026-10-20T00:00:04Z'   # +200 tok / 2s
+check "a second response accumulates into the rate" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" R 2000)")" "100.0 tok/s"
+
+check "a repeated render does not inflate the rate" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" R 2000)")" "100.0 tok/s"
+
+# The same response recorded again (Claude Code does this for multi-block
+# messages) must not be counted twice.
+jq -cn --arg id "r2" --arg ts '2026-10-20T00:00:04Z' --arg ref "q2" \
+  '{type:"assistant",requestRef:$ref,timestamp:$ts,
+    message:{id:$id,usage:{output_tokens:200}}}' >> "$TRANSCRIPTS/R.jsonl"
+check "a duplicated transcript record is counted once" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" R 2000)")" "100.0 tok/s"
+
+add_pair R3 q1 r1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+check "rate survives a model with no price card" \
+  "$(rate_of "$(rate_run '{"display":true}' R3 1000)")" "100.0 tok/s"
+
+add_pair R4 q1 r1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+check "rate survives PET_PRICING_COST=0" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" R4 1000 PET_PRICING_COST=0)")" "100.0 tok/s"
+
+# The priced estimate must stay off when the user turned it off, even though the
+# block now also runs for the rate's sake.
+check "PET_PRICING_COST=0 still keeps Claude's cost" \
+  "$(rate_run "$RATE_CONFIG" R4 1000 PET_PRICING_COST=0 | grep -o '\$[0-9.]*' | head -1)" '$1.0000'
+
+nocheck "PET_OUTPUT_RATE=0 hides the rate" \
+  "$(rate_run "$RATE_CONFIG" R 2000 PET_OUTPUT_RATE=0)" "tok/s"
+
+# A state file written by an older version carries counts in a shape this one
+# cannot continue from, so it is rescanned from scratch rather than added to.
+add_pair RM q1 r1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+printf '%s' '{"sessions":{"RM":{"out_tokens_total":5000,"paired_tokens":9000,
+  "transcript_offset":99999,"rate_v":2,"counted_ids":["r1"]}}}' \
+  > "$PET_DIR/cost-state.json"
+check "an older state shape is rescanned, not continued" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RM 1000)")" "100.0 tok/s"
+check "and the rescan drops the stale dedupe set" \
+  "$(jq -r '.sessions.RM.paired_tokens' "$PET_DIR/cost-state.json")" "100"
+
+nocheck "rate is a hideable segment" \
+  "$(rate_run "$(jq -c '.info = {hide: ["rate"]}' <<< "$RATE_CONFIG")" R 2000)" "tok/s"
+
+# A response is only counted when the api-request record that produced it has
+# been seen, because the wait is the difference between the two timestamps. The
+# pair can land in different reads, so an unmatched request id has to survive in
+# the state until its response arrives.
+# The measured wait is the request→response difference, not the gap between
+# responses: 100 tokens produced over a 2s wait plus 300 over a 4s wait is
+# 400/6s, even though the responses sit 10s apart on the clock.
+add_pair RP p1 m1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:02Z'
+add_pair RP p2 m2 300 '2026-10-20T00:00:10Z' '2026-10-20T00:00:14Z'
+check "rate divides tokens by the request→response wait" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RP 999999)")" "66.7 tok/s"
+
+# A response whose request record was dropped (what compaction does to the
+# history it discards) is skipped rather than counted with a guessed wait.
+jq -cn '{type:"assistant",requestRef:"gone",timestamp:"2026-10-20T00:01:00Z",
+  message:{id:"orphan",usage:{output_tokens:9999}}}' >> "$TRANSCRIPTS/RP.jsonl"
+check "a response with no matching request is skipped" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RP 999999)")" "66.7 tok/s"
+
+# The payload's own API total must not enter the figure at all: it carries time
+# for history a compaction has already dropped, which is what made a live
+# session read 26 tok/s against a real ~180.
+check "the payload's API total is ignored" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RP 999999)")" "66.7 tok/s"
+
+# requestRef arrived in Claude Code 2.1.301. A transcript recorded before that
+# has responses but no api-request records, so nothing can be paired — the
+# segment must go quiet rather than fall back to a guess. The payload here
+# carries a plausible-looking API total, which is exactly the trap.
+add_response ROLD o1 5000 '2026-10-20T00:00:00Z'
+add_response ROLD o2 5000 '2026-10-20T00:00:01Z'
+nocheck "a pre-2.1.301 transcript shows no rate at all" \
+  "$(rate_run "$RATE_CONFIG" ROLD 2000)" "tok/s"
+check "and it does not invent one from the payload" \
+  "$(jq -r '.sessions.ROLD.paired_tokens // 0' "$PET_DIR/cost-state.json")" "0"
+# Nothing pairs in that transcript, so a guard keyed on paired tokens would
+# never persist the offset and every render would rescan the whole file from the
+# top for the rest of the session — the cost of this feature growing with the
+# session, in the case that produces no rate to show for it.
+check "and its offset is persisted anyway" \
+  "$(jq -r '.sessions.ROLD.transcript_offset | floor' "$PET_DIR/cost-state.json")" \
+  "$(wc -c < "$TRANSCRIPTS/ROLD.jsonl" | tr -d ' ')"
+# ...and persisted once, not on every render: the offset not moving means the
+# scan consumed nothing, which is the case worth skipping the write for.
+ROLD_MTIME="$(stat -c %Y "$PET_DIR/cost-state.json" 2>/dev/null || stat -f %m "$PET_DIR/cost-state.json")"
+sleep 1
+rate_run "$RATE_CONFIG" ROLD 2000 >/dev/null
+check "a render with nothing new does not rewrite the state" \
+  "$(stat -c %Y "$PET_DIR/cost-state.json" 2>/dev/null || stat -f %m "$PET_DIR/cost-state.json")" \
+  "$ROLD_MTIME"
+
+# Claude Code's append can be caught mid-write: a usage record averages 3-4 KB
+# and peaks past 50 KB, so the tail of the file is often a fragment. The offset
+# has to stop at the last complete line — advancing past a fragment means the
+# next read starts after a record that is still arriving, and that response is
+# lost for good rather than merely late.
+add_pair RF q1 r1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+check "the pair before a fragment reads normally" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RF 1000)")" "100.0 tok/s"
+
+add_request RF q2 '2026-10-20T00:00:02Z'
+WHOLE="$TMP/whole-record.jsonl"
+jq -cn --arg id "r2" --argjson out 300 --arg ts '2026-10-20T00:00:04Z' --arg ref "q2" \
+  '{type:"assistant",requestRef:$ref,timestamp:$ts,
+    message:{id:$id,usage:{output_tokens:$out}}}' > "$WHOLE"
+UPTO="$(wc -c < "$TRANSCRIPTS/RF.jsonl" | tr -d ' ')"
+head -c 30 "$WHOLE" >> "$TRANSCRIPTS/RF.jsonl"     # the writer is still going
+check "a half-written last line is not counted" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RF 2000)")" "100.0 tok/s"
+check "and the offset stops at the last complete line" \
+  "$(jq -r '.sessions.RF.transcript_offset | floor' "$PET_DIR/cost-state.json")" "$UPTO"
+
+tail -c +31 "$WHOLE" >> "$TRANSCRIPTS/RF.jsonl"    # the writer finishes it
+check "the response is counted once its line is complete" \
+  "$(rate_of "$(rate_run "$RATE_CONFIG" RF 2000)")" "133.3 tok/s"
 
 # ── peak-tariff alert ────────────────────────────────────────────────────────
 # Peak costs double, so past a cost threshold the warning moves to the front of

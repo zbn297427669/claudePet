@@ -92,7 +92,7 @@ set_display() { # $1 = true|false
 # info.show is the master switch; info.hide drops single segments while it is on.
 # `model` is not hideable — it is the line's identity, so the bar cannot end up
 # blank by accident (to hide everything, use info off).
-SEGMENTS="model dir branch context cache out cost duration lines"
+SEGMENTS="model dir branch context cache out rate cost duration lines"
 
 set_info_show() { # $1 = true|false
   local value="$1" out

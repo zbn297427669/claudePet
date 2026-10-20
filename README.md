@@ -25,7 +25,7 @@ Then restart Claude Code. Your pet appears in the status line.
 ## What You Get
 
 - **Pixel creature** in your status line that evolves through 5 stages
-- **Richer status line metrics** — ASCII context bar with used/size tokens, cache hit rate (`cache 99% · 207k`), output tokens, session duration, and lines changed
+- **Richer status line metrics** — ASCII context bar with used/size tokens, cache hit rate (`cache 99% · 207k`), output tokens, output rate (`148.0 tok/s`), session duration, and lines changed
 - **Prompt scoring** across 5 dimensions (specificity, context, actionability, scope, constraints)
 - **XP system** — better prompts = more XP = faster evolution
 - **9 creature families** — randomly assigned, each with unique personality and voice
@@ -78,7 +78,7 @@ creature only, `/pet info off` hides the numbers only, and both off prints
 nothing at all — which leaves **one empty status line row**, because Claude Code
 reserves that region for whatever the configured statusLine command prints. That
 blank row is the interface's, not the script's: reclaiming it means removing the
-`statusLine` setting rather than hiding more segments. Segments you can hide are `model dir branch context cache out
+`statusLine` setting rather than hiding more segments. Segments you can hide are `model dir branch context cache out rate
 cost duration lines`; `model` is deliberately not hideable — it is the identity
 of the line — so hiding everything is `/pet info off` rather than a long list.
 Hiding the bar does **not** stop the cost estimate accumulating, so switching it
@@ -150,6 +150,21 @@ export PET_PRICING_WATCH=my-model,other-model
 Prices are fetched from the **OpenRouter public catalog** as an approximation — not official vendor billing. Matched rates land in `config.json` under `pricing.models`.
 
 When a match exists, the status line may recompute an **estimate** from recent `current_usage` snapshots. This can undercount (for example if the session started before pricing was enabled). Disable with `PET_PRICING_COST=0` to keep Claude's `total_cost_usd`.
+
+### Output rate
+
+The `rate` segment (`172.0 tok/s`) is output tokens divided by the API time they took to produce, so it measures generation speed rather than throughput over the session's whole life — idle time, tool calls and the time you spend reading don't count against it. It needs no price card, so it keeps working for a model the pricing table doesn't know; disable it with `PET_OUTPUT_RATE=0`.
+
+Both terms are read from the session transcript, and only the bytes appended since the last render, which keeps a render at a few tens of milliseconds.
+
+- **The tokens** cannot come from `current_usage.output_tokens`: that describes only the last response, and the status line renders every ~30s, so sampling it drops every response that finishes in between — in a tool-calling turn that is most of them, and it read about 4x low.
+- **The API time** cannot come from the payload's `total_api_duration_ms` either. That counter is not confined to the transcript: after a resume, `/clear`, or an **auto-compaction** it still counts API time for history that is no longer here. One session had discarded 758,966 tokens of history and read 26.4 tok/s this way, against a real ~184.
+
+Instead each assistant record's `requestRef` is matched to the `api-request` record that produced it, and the wait is that pair's timestamp difference — no estimation. Because a dropped history takes its `api-request` records with it, the pairs that survive are exactly the window both terms can see, so the two always agree. Responses whose request record is gone (compaction, or a resume whose earlier transcript is elsewhere) are skipped rather than counted with a guessed wait, and a wait over 600s is ignored as a resume or a stalled connection rather than generation time.
+
+This is a Claude Code record format, not a model feature, so it works the same for any model or gateway — but it does need **Claude Code 2.1.301 or later**, which is where `requestRef` appears. A transcript from 2.1.296 or earlier has no `api-request` records at all and simply shows no rate, rather than a wrong one; a session spanning the upgrade shows a rate over the responses it can pair. Run `claude --version` if the segment never appears.
+
+What remains is that this is an average over the session, not the speed of the response you are watching: a long fast session and a short slow one smooth into the same line. A heavily compacted session's figure covers only the surviving window, so it describes recent speed rather than the whole session — arguably the more useful reading. Disabling and re-enabling the segment does not reset it: the accumulation is keyed by session in `cost-state.json`, so `rm ~/.claude/claude-pet/cost-state.json` is what starts a session over.
 
 ### DeepSeek peak / off-peak
 

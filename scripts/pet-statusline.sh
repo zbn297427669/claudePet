@@ -74,37 +74,294 @@ IFS=$'\x1f' read -r \
 # Optional local $/MTok estimate (auto-updated); may undercount — see README
 COST_STATE="$PET_DIR/cost-state.json"
 COST_TIER=""   # set to peak/off_peak when the model carries a peak/off-peak card
-if [[ "${PET_PRICING_COST:-1}" != "0" && -f "$PET_CONFIG" ]] && command -v python3 >/dev/null 2>&1; then
+# The block below serves two independent features: the priced cost estimate
+# (PET_PRICING_COST) and the output rate (PET_OUTPUT_RATE). Run it when either
+# is wanted — gating both on the pricing switch would silently take the rate
+# down with it.
+if { [[ "${PET_PRICING_COST:-1}" != "0" ]] || [[ "${PET_OUTPUT_RATE:-1}" != "0" ]]; } \
+   && [[ -f "$PET_CONFIG" ]] && command -v python3 >/dev/null 2>&1; then
   COST_CUSTOM=$(
     PET_COST_STATE="$COST_STATE" python3 - "$PET_CONFIG" \
       "${MODEL_ID:-}" "${MODEL:-}" "${SESSION_ID:-}" \
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
-      "${COST:-0}" <<'PY'
+      "${COST:-0}" "${DIR:-}" <<'PY'
 import json, os, re, sys
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
-cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback = sys.argv[1:10]
+cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback, cwd = sys.argv[1:11]
 state_path = Path(os.environ.get("PET_COST_STATE") or Path.home() / ".claude/claude-pet/cost-state.json")
 
 # Fallback schedule if the config carries no schedule (peak windows are UTC)
 DEFAULT_PEAK_WINDOWS = [["01:00", "04:00"], ["06:00", "10:00"]]
 # Sessions kept in cost-state.json; older ones are dropped as new ones appear
 MAX_SESSIONS = 20
+# Shape of the rate fields in the state entry. Bump this whenever a stored
+# field's meaning changes, so entries written by an older version are rescanned
+# from scratch instead of being continued from (see scan_transcript). v4: the
+# offset is now a line boundary, where v3 could leave it inside a fragment.
+RATE_STATE_V = 4
+# A response that took longer than this is a resume, a sleeping laptop or a
+# stalled connection rather than generation time; counting it would let one
+# outlier swamp the average.
+MAX_WAIT_S = 600
 
 def norm(s: str) -> str:
     s = (s or "").lower().strip().split("/")[-1].lstrip("~").split(":")[0]
     return re.sub(r"[^a-z0-9]+", "", s)
 
+
+def _num(x) -> float:
+    try:
+        return float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _epoch(raw):
+    """ISO-8601 timestamp to epoch seconds, or None if unusable."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# ── per-session state ───────────────────────────────────────────────────────
+# One read/modify/write pair, shared by the two accumulators below. The map is
+# keyed by session id: a single slot meant any id change — resuming, or a second
+# session rendering at the same time — threw the running total away and the
+# status line appeared to reset.
+def load_sessions() -> dict:
+    try:
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    sessions = st.get("sessions") if isinstance(st.get("sessions"), dict) else {}
+    if not sessions and st.get("session_id"):        # migrate the old single-slot shape
+        sessions = {st["session_id"]: {"total_usd": st.get("total_usd") or 0.0,
+                                       "last_fp": st.get("last_fp") or "",
+                                       "model": st.get("model") or ""}}
+    return sessions
+
+
+def trim_sessions(sessions: dict) -> dict:
+    if len(sessions) > MAX_SESSIONS:                 # keep the map from growing forever
+        stale = sorted(sessions, key=lambda k: (sessions[k] or {}).get("updated_at") or "")
+        for key in stale[:-MAX_SESSIONS]:
+            sessions.pop(key, None)
+    return sessions
+
+
+def save_sessions(sessions: dict) -> None:
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        tmp.replace(state_path)
+    except Exception:
+        pass
+
+
+# ── output rate ─────────────────────────────────────────────────────────────
+# Output tokens per second of API time, kept out of the cost math below: the
+# rate must survive a missing or unmatched price card, and those paths exit
+# early.
+#
+# The numerator comes from the session transcript, not from the payload.
+# current_usage.output_tokens only describes the *last* response, and this
+# script renders every ~30s, so sampling it loses every response that completes
+# in between — in a tool-calling turn that is most of them. Measured against the
+# transcript it read about 4x low (29.6k vs 126k over a 16-minute session). The
+# transcript records every response, so it is the only sound source. Reading it
+# incrementally keeps this cheap: only the bytes appended since the last render.
+#
+# The denominator is the API-wait time of those same responses, measured
+# request by request. It excludes the time the session spent idle, waiting on
+# the user, or running tools, so the ratio is generation speed rather than
+# throughput over the session's life.
+def projects_root() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+    return Path(base) / "projects"
+
+
+def transcript_for(session_id: str, cwd: str):
+    """The session's .jsonl, or None. Claude Code names the project directory
+    after the cwd with every '/' replaced by '-'; fall back to any project
+    because the cwd can change after a session starts (e.g. /add-dir)."""
+    if not session_id or session_id == "default":
+        return None
+    root = projects_root()
+    try:
+        exact = root / (cwd or "").replace("/", "-") / f"{session_id}.jsonl"
+        if exact.is_file():
+            return exact
+        for cand in root.glob(f"*/{session_id}.jsonl"):
+            return cand
+    except OSError:
+        pass
+    return None
+
+
+def scan_transcript(path, entry: dict):
+    """(paired output tokens, paired API milliseconds) for this transcript.
+
+    Only new lines are read, and only whole ones — see the fragment note below.
+    Deduplicated by message id, the same key the cost audit uses: one response
+    can be recorded more than once, and counting those again would inflate the
+    rate just as badly as missing them deflates it.
+
+    The API time is measured per response rather than taken from the payload's
+    running total. An assistant record carries requestRef, which is exactly the
+    id of the api-request record that produced it, so the wait is that pair's
+    timestamp difference — no estimation involved. This matters because the
+    payload's total is not confined to the transcript: after a resume or an
+    auto-compaction it still counts API time for history that is no longer
+    here, while the tokens can only be counted where they survive. Pairing
+    keeps both terms over the same responses, and a dropped history takes its
+    api-request records with it, so the surviving pairs are exactly the window
+    both can see.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return _num(entry.get("paired_tokens")), _num(entry.get("paired_api_ms"))
+
+    offset = _num(entry.get("transcript_offset"))
+    tokens = _num(entry.get("paired_tokens"))
+    api_ms = _num(entry.get("paired_api_ms"))
+    seen = set(entry.get("counted_ids") or [])
+    # api-request records can land in a different read than their response, so
+    # unmatched ids are carried in the state until the response shows up.
+    pending = entry.get("pending_requests")
+    pending = dict(pending) if isinstance(pending, dict) else {}
+    # Start over unless this entry was written by this version, and whenever the
+    # file shrank (truncated, rewritten, or compacted away under us). The dedupe
+    # set and the pending map have to be cleared with the offset, or the rescan
+    # skips every response it already knows and the numerator keeps only what
+    # arrived after the reset — the opposite error, and just as wrong.
+    if entry.get("rate_v") != RATE_STATE_V or size < offset:
+        offset, tokens, api_ms, seen, pending = 0.0, 0.0, 0.0, set(), {}
+
+    # A usage record averages 3-4 KB and peaks past 50 KB, so Claude Code's
+    # append can be caught mid-write: the last line is then a fragment. The
+    # offset only advances over a line that ended in a newline, so the fragment
+    # is re-read once it is complete — advancing past it would persist a byte
+    # count that starts the next read after a record no longer in the file, and
+    # that response would be lost for good rather than merely late.
+    try:
+        with path.open("rb") as f:
+            f.seek(int(offset))
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break
+                try:
+                    rec = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:
+                    offset += len(raw)
+                    continue
+                offset += len(raw)
+                if rec.get("type") == "api-request":
+                    rid = rec.get("id")
+                    rts = _epoch(rec.get("timestamp"))
+                    if rid and rts:
+                        pending[rid] = rts
+                    continue
+                msg = rec.get("message")
+                usage = msg.get("usage") if isinstance(msg, dict) else None
+                if not isinstance(usage, dict):
+                    continue
+                key = msg.get("id") or rec.get("uuid")
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                # Only a response whose request we have seen counts, so the
+                # numerator and the denominator cover the same responses.
+                req_ts = pending.pop(rec.get("requestRef"), None)
+                if req_ts is None:
+                    continue
+                ts = _epoch(rec.get("timestamp"))
+                if ts is None:
+                    continue
+                wait = ts - req_ts
+                if 0 <= wait < MAX_WAIT_S:
+                    tokens += _num(usage.get("output_tokens"))
+                    api_ms += wait * 1000.0
+    except OSError:
+        pass
+
+    entry["paired_tokens"] = tokens
+    entry["paired_api_ms"] = api_ms
+    entry["transcript_offset"] = offset
+    entry["pending_requests"] = dict(list(pending.items())[-500:])
+    entry["rate_v"] = RATE_STATE_V
+    # Bounded: only responses recent enough to still be in flight need this.
+    entry["counted_ids"] = list(seen)[-200:]
+    return tokens, api_ms
+
+
+rate_str = ""
+if os.environ.get("PET_OUTPUT_RATE", "1") != "0":
+    sessions = load_sessions()
+    sid = session_id or "default"
+    entry = sessions.get(sid)
+    if not isinstance(entry, dict):
+        entry = {}
+
+    path = transcript_for(sid, cwd)
+    read_before = entry.get("transcript_offset")
+    if path:
+        tokens, api_ms = scan_transcript(path, entry)
+    else:
+        tokens, api_ms = 0.0, 0.0
+
+    # Both terms come from the transcript and cover the same responses, so this
+    # needs no use of the payload's API total and no clamp to keep them in step.
+    if api_ms > 0 and tokens > 0:
+        entry["rate_tok_s"] = tokens / (api_ms / 1000.0)
+    rate = entry.get("rate_tok_s")
+    if isinstance(rate, (int, float)) and rate > 0:
+        rate_str = f"{rate:.1f}"
+
+    # Write only when the scan consumed something: this renders every 30s, and a
+    # no-op write on each would be pure churn. Keyed on the offset advancing, not
+    # on having paired a response — a transcript whose responses cannot be paired
+    # (a pre-2.1.301 one, or a history a compaction dropped) pairs nothing at all,
+    # and a token-based guard would never persist the offset, so every render
+    # would rescan the whole file for the life of the session and grow the dedupe
+    # set in memory without bound.
+    if path and entry.get("transcript_offset") != read_before:
+        entry["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        sessions[sid] = entry
+        save_sessions(trim_sessions(sessions))
+
+
+def emit(cost, tier="", ctx="", secs="", direction="", premium=""):
+    """The single output line. Every exit goes through here so the rate is
+    reported even on the paths that cannot price the request."""
+    print("|".join([str(cost), str(tier), str(ctx), str(secs),
+                    str(direction), str(premium), rate_str]))
+
+
 try:
     cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
 except Exception:
-    print(fallback); raise SystemExit(0)
+    emit(fallback); raise SystemExit(0)
+
+# PET_PRICING_COST=0 means "keep Claude's total_cost_usd". The block still runs
+# when only the rate is wanted, so honour that here rather than computing an
+# estimate the user switched off.
+if os.environ.get("PET_PRICING_COST", "1") == "0":
+    emit(fallback); raise SystemExit(0)
 
 pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
 models = pricing.get("models") if isinstance(pricing.get("models"), dict) else {}
 if not models:
-    print(fallback); raise SystemExit(0)
+    emit(fallback); raise SystemExit(0)
 
 candidates = []
 for raw in (model_id, model_name):
@@ -143,7 +400,7 @@ if price is None:
         price = best[1]
 
 if not isinstance(price, dict):
-    print(fallback); raise SystemExit(0)
+    emit(fallback); raise SystemExit(0)
 
 # The model's context window, when the config knows it. Claude Code reports 200k
 # for models it does not recognise as extended-context, which is wrong for a
@@ -247,7 +504,7 @@ try:
     cr_r = float(rates.get("cache_read_per_mtok") or 0)
     tin = float(u_in or 0); tcc = float(u_cc or 0); tcr = float(u_cr or 0); tout = float(u_out or 0)
 except Exception:
-    print(fallback); raise SystemExit(0)
+    emit(fallback); raise SystemExit(0)
 
 # last-request USD estimate
 delta = (tin * in_r + tcc * in_r + tcr * cr_r + tout * out_r) / 1e6
@@ -266,22 +523,13 @@ if tier == "peak" and isinstance(price.get("off_peak"), dict):
     except (TypeError, ValueError):
         premium_delta = 0.0
 
-try:
-    st = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
-except Exception:
-    st = {}
-if not isinstance(st, dict):
-    st = {}
-
-# Accumulate per session. A single slot keyed by session id meant any id change
-# — resuming, or another session rendering at the same time — threw the running
-# total away and the status line appeared to reset.
+# Accumulate the priced part of the session. The state helpers are the ones the
+# rate accumulator above used, so the two share the file without clobbering each
+# other's keys. They track new responses differently on purpose — this one by a
+# usage fingerprint, the rate by how far the transcript has been read — because
+# a shared marker would let whichever ran first consume the other's signal.
 sid = session_id or "default"
-sessions = st.get("sessions") if isinstance(st.get("sessions"), dict) else {}
-if not sessions and st.get("session_id"):        # migrate the old single-slot shape
-    sessions = {st["session_id"]: {"total_usd": st.get("total_usd") or 0.0,
-                                   "last_fp": st.get("last_fp") or "",
-                                   "model": st.get("model") or ""}}
+sessions = load_sessions()
 entry = sessions.get(sid)
 if not isinstance(entry, dict):
     entry = {"total_usd": 0.0, "last_fp": ""}
@@ -299,22 +547,12 @@ if fp != "0|0|0|0" and fp != last_fp:
     if premium_delta:
         entry["premium_usd"] = float(entry.get("premium_usd") or 0.0) + premium_delta
     sessions[sid] = entry
-    if len(sessions) > MAX_SESSIONS:               # keep the map from growing forever
-        for stale in sorted(sessions, key=lambda k: sessions[k].get("updated_at") or "")[:-MAX_SESSIONS]:
-            sessions.pop(stale, None)
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2) + "\n",
-                       encoding="utf-8")
-        tmp.replace(state_path)
-    except Exception:
-        pass
+    save_sessions(trim_sessions(sessions))
 
 # If we have no accumulated usage yet, fall back to Claude's number.
-# Fields: <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>
-# The last four describe the tariff, so they are emitted even when the cost had
-# to fall back — the shell decides how loudly to say it.
+# Fields: <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>|<tok/s>
+# The tariff fields are emitted even when the cost had to fall back — the shell
+# decides how loudly to say it — and the rate is emitted whenever it is known.
 switch_secs, switch_dir = next_switch(utc_now()) if tier else (0, "")
 premium = float(entry.get("premium_usd") or 0.0)
 print("|".join([
@@ -324,13 +562,15 @@ print("|".join([
     str(switch_secs or ""),
     switch_dir or "",
     f"{premium:.6f}" if premium else "",
+    rate_str,
 ]))
 PY
   )
   if [[ -n "$COST_CUSTOM" ]]; then
-    # <usd>|<tier>|<context tokens>|<secs to switch>|<direction>|<premium usd>
+    # <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>|<tok/s>
     # a bare number means none of it was available
-    IFS='|' read -r COST COST_TIER COST_WINDOW COST_SECS COST_DIR COST_PREMIUM <<< "$COST_CUSTOM"
+    IFS='|' read -r COST COST_TIER COST_WINDOW COST_SECS COST_DIR COST_PREMIUM RATE_TOK_S \
+      <<< "$COST_CUSTOM"
   fi
 fi
 
@@ -599,6 +839,9 @@ seg_on branch   && [[ -n "$BRANCH" ]] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}
 seg_on context  && L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}% ${CTX_NUM}${RST}"
 seg_on cache    && [[ -n "$CACHE_SEG" ]] && L="${L}${SEP}${GRAY}${CACHE_SEG}${RST}"
 seg_on out      && [[ "${OUT_TOK:-0}" != "0" ]] && L="${L}${SEP}${GRAY}out ${OUT_FMT}${RST}"
+RATE_FMT=""
+if [[ -n "${RATE_TOK_S:-}" ]]; then printf -v RATE_FMT '%.1f' "$RATE_TOK_S" 2>/dev/null || RATE_FMT="$RATE_TOK_S"; fi
+seg_on rate     && [[ -n "$RATE_FMT" ]] && L="${L}${SEP}${GRAY}${RATE_FMT} tok/s${RST}"
 seg_on cost     && L="${L}${SEP}${GRAY}${COST_FMT}${RST}"
 seg_on duration && [[ "${DUR_MS:-0}" != "0" ]] && L="${L}${SEP}${GRAY}${DUR_FMT}${RST}"
 if seg_on lines && { [[ "${LINES_ADD:-0}" != "0" ]] || [[ "${LINES_DEL:-0}" != "0" ]]; }; then

@@ -86,8 +86,15 @@ if { [[ "${PET_PRICING_COST:-1}" != "0" ]] || [[ "${PET_OUTPUT_RATE:-1}" != "0" 
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
       "${COST:-0}" "${DIR:-}" <<'PY'
 import json, os, re, sys
+from contextlib import contextmanager
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+
+try:
+    import fcntl                                     # POSIX only; see state_lock
+except ImportError:
+    fcntl = None
+import time as _time                                 # `time` below is datetime.time
 
 cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback, cwd = sys.argv[1:11]
 state_path = Path(os.environ.get("PET_COST_STATE") or Path.home() / ".claude/claude-pet/cost-state.json")
@@ -159,12 +166,53 @@ def trim_sessions(sessions: dict) -> dict:
 def save_sessions(sessions: dict) -> None:
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = state_path.with_suffix(".tmp")
+        # Unique tmp name: the rename below is atomic, but two writers sharing
+        # one tmp path would interleave their writes into it first.
+        tmp = state_path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2) + "\n",
                        encoding="utf-8")
         tmp.replace(state_path)
     except Exception:
-        pass
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
+@contextmanager
+def state_lock():
+    """Exclusive lock over one read/modify/write of the state file.
+
+    Renders really do overlap: the status line refreshes every 30s while hooks
+    fire for the same session, and a second Claude Code session writes this same
+    file. Without the lock both load the map, both save, and the second save
+    drops the first's session — a whole session's cost and rate disappear, and
+    not in a narrow window: two sessions rendering together lost one of them in
+    12 of 12 trials, and even a 1 KB transcript lost one in 8 of 12.
+
+    flock on a sidecar file rather than on cost-state.json: save_sessions
+    replaces the state file by rename, so a lock held on the old inode would not
+    exclude a render that had already opened the new one. The sidecar is never
+    replaced, so every writer locks the same inode.
+    """
+    if fcntl is None:                                # platform without flock
+        yield
+        return
+    lock_path = state_path.with_suffix(".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield                                        # cannot lock; proceed unlocked
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 # ── output rate ─────────────────────────────────────────────────────────────
@@ -306,38 +354,56 @@ def scan_transcript(path, entry: dict):
 
 rate_str = ""
 if os.environ.get("PET_OUTPUT_RATE", "1") != "0":
-    sessions = load_sessions()
     sid = session_id or "default"
-    entry = sessions.get(sid)
-    if not isinstance(entry, dict):
-        entry = {}
-
     path = transcript_for(sid, cwd)
-    read_before = entry.get("transcript_offset")
-    if path:
-        tokens, api_ms = scan_transcript(path, entry)
-    else:
-        tokens, api_ms = 0.0, 0.0
+    # The load, the scan and the save are one read-modify-write of the shared
+    # map, so all three stay inside the lock: scanning outside it would put the
+    # whole transcript read in the window where another render can load the same
+    # map and save over this one's session.
+    with state_lock():
+        sessions = load_sessions()
+        entry = sessions.get(sid)
+        if not isinstance(entry, dict):
+            entry = {}
 
-    # Both terms come from the transcript and cover the same responses, so this
-    # needs no use of the payload's API total and no clamp to keep them in step.
-    if api_ms > 0 and tokens > 0:
-        entry["rate_tok_s"] = tokens / (api_ms / 1000.0)
-    rate = entry.get("rate_tok_s")
-    if isinstance(rate, (int, float)) and rate > 0:
-        rate_str = f"{rate:.1f}"
+        read_before = entry.get("transcript_offset")
+        if path:
+            tokens, api_ms = scan_transcript(path, entry)
+        else:
+            tokens, api_ms = 0.0, 0.0
 
-    # Write only when the scan consumed something: this renders every 30s, and a
-    # no-op write on each would be pure churn. Keyed on the offset advancing, not
-    # on having paired a response — a transcript whose responses cannot be paired
-    # (a pre-2.1.301 one, or a history a compaction dropped) pairs nothing at all,
-    # and a token-based guard would never persist the offset, so every render
-    # would rescan the whole file for the life of the session and grow the dedupe
-    # set in memory without bound.
-    if path and entry.get("transcript_offset") != read_before:
-        entry["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        sessions[sid] = entry
-        save_sessions(trim_sessions(sessions))
+        # Test hook: hold the read-modify-write open, standing in for a slow
+        # scan. It sits between the load and the save, which is the window the
+        # lock closes — so with the lock held this only serialises the writers,
+        # while without it two renders reliably lose one of the two sessions.
+        hold = os.environ.get("PET_TEST_STATE_HOLD")
+        if hold:
+            try:
+                _time.sleep(float(hold))
+            except (TypeError, ValueError):
+                pass
+
+        # Both terms come from the transcript and cover the same responses, so
+        # this needs no use of the payload's API total and no clamp to keep them
+        # in step.
+        if api_ms > 0 and tokens > 0:
+            entry["rate_tok_s"] = tokens / (api_ms / 1000.0)
+        rate = entry.get("rate_tok_s")
+        if isinstance(rate, (int, float)) and rate > 0:
+            rate_str = f"{rate:.1f}"
+
+        # Write only when the scan consumed something: this renders every 30s,
+        # and a no-op write on each would be pure churn. Keyed on the offset
+        # advancing, not on having paired a response — a transcript whose
+        # responses cannot be paired (a pre-2.1.301 one, or a history a
+        # compaction dropped) pairs nothing at all, and a token-based guard
+        # would never persist the offset, so every render would rescan the whole
+        # file for the life of the session and grow the dedupe set in memory
+        # without bound.
+        if path and entry.get("transcript_offset") != read_before:
+            entry["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            sessions[sid] = entry
+            save_sessions(trim_sessions(sessions))
 
 
 def emit(cost, tier="", ctx="", secs="", direction="", premium=""):
@@ -529,25 +595,26 @@ if tier == "peak" and isinstance(price.get("off_peak"), dict):
 # usage fingerprint, the rate by how far the transcript has been read — because
 # a shared marker would let whichever ran first consume the other's signal.
 sid = session_id or "default"
-sessions = load_sessions()
-entry = sessions.get(sid)
-if not isinstance(entry, dict):
-    entry = {"total_usd": 0.0, "last_fp": ""}
+with state_lock():
+    sessions = load_sessions()
+    entry = sessions.get(sid)
+    if not isinstance(entry, dict):
+        entry = {"total_usd": 0.0, "last_fp": ""}
 
-total = float(entry.get("total_usd") or 0.0)
-last_fp = entry.get("last_fp") or ""
-if fp != "0|0|0|0" and fp != last_fp:
-    total += delta
-    entry.update({
-        "total_usd": total,
-        "last_fp": fp,
-        "model": model_id or model_name,
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    })
-    if premium_delta:
-        entry["premium_usd"] = float(entry.get("premium_usd") or 0.0) + premium_delta
-    sessions[sid] = entry
-    save_sessions(trim_sessions(sessions))
+    total = float(entry.get("total_usd") or 0.0)
+    last_fp = entry.get("last_fp") or ""
+    if fp != "0|0|0|0" and fp != last_fp:
+        total += delta
+        entry.update({
+            "total_usd": total,
+            "last_fp": fp,
+            "model": model_id or model_name,
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        if premium_delta:
+            entry["premium_usd"] = float(entry.get("premium_usd") or 0.0) + premium_delta
+        sessions[sid] = entry
+        save_sessions(trim_sessions(sessions))
 
 # If we have no accumulated usage yet, fall back to Claude's number.
 # Fields: <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>|<tok/s>

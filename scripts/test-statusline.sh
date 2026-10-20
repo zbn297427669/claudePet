@@ -420,6 +420,37 @@ tail -c +31 "$WHOLE" >> "$TRANSCRIPTS/RF.jsonl"    # the writer finishes it
 check "the response is counted once its line is complete" \
   "$(rate_of "$(rate_run "$RATE_CONFIG" RF 2000)")" "133.3 tok/s"
 
+# ── concurrent renders share the state file ──────────────────────────────────
+# The status line refreshes every 30s while hooks fire for the same session, and
+# a second Claude Code session renders against the same cost-state.json. Two
+# renders that each load the map, scan, then save will have the second save drop
+# the first's session — an entire session's cost and rate vanish. This was not a
+# narrow window: before the lock, two sessions rendering together lost one in
+# 12 of 12 trials, and even a 1 KB transcript lost one in 8 of 12.
+#
+# PET_TEST_STATE_HOLD stands in for a slow scan by holding the read-modify-write
+# open, which makes the overlap deterministic instead of a matter of timing
+# luck. It sits between the load and the save, so with the lock held it only
+# serialises the writers, while without it every trial loses an entry.
+add_pair RACE_A q1 m1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+add_pair RACE_B q1 m1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+
+race_sessions() { # number of sessions in the state file after one concurrent round
+  rm -f "$PET_DIR/cost-state.json"
+  local s
+  for s in RACE_A RACE_B; do
+    rate_run "$RATE_CONFIG" "$s" 1000 "PET_TEST_STATE_HOLD=0.6" >/dev/null &
+  done
+  wait
+  jq -r '.sessions | length' "$PET_DIR/cost-state.json" 2>/dev/null || echo 0
+}
+
+race_kept=0
+for _ in 1 2 3; do
+  [[ "$(race_sessions)" == "2" ]] && race_kept=$((race_kept + 1))
+done
+check "concurrent renders do not drop each other's session" "$race_kept" "3"
+
 # ── peak-tariff alert ────────────────────────────────────────────────────────
 # Peak costs double, so past a cost threshold the warning moves to the front of
 # the line with a countdown; before peak starts it pre-warns instead. Every knob

@@ -178,10 +178,32 @@ pet_fetch "$WORK/holiday-$CUR_YEAR.json" "${PET_PRICING_HOLIDAY_FILE:-}" \
   "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/$CUR_YEAR.json" \
   && HOLIDAY_CUR="$WORK/holiday-$CUR_YEAR.json" || true
 
+# jsDelivr serves the same repository from several hosts, and which ones answer
+# varies by network — cdn.jsdelivr.net was reset from one Windows machine while
+# fastly, gcore and testingcf all returned 200 with identical content. Retrying
+# the same URL would not help; asking a different host does.
+if [[ -z "$HOLIDAY_CUR" ]]; then
+  for _mirror in fastly gcore testingcf; do
+    pet_fetch "$WORK/holiday-$CUR_YEAR.json" "" \
+      "https://$_mirror.jsdelivr.net/gh/NateScarlet/holiday-cn@master/$CUR_YEAR.json" \
+      && HOLIDAY_CUR="$WORK/holiday-$CUR_YEAR.json" && break || true
+  done
+  unset _mirror
+fi
+
 # Next year is only published late in the current one; a 404 here is normal
 pet_fetch "$WORK/holiday-$NEXT_YEAR.json" "" \
   "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/$NEXT_YEAR.json" \
   && HOLIDAY_NEXT="$WORK/holiday-$NEXT_YEAR.json" || true
+
+if [[ -z "$HOLIDAY_NEXT" ]]; then
+  for _mirror in fastly gcore testingcf; do
+    pet_fetch "$WORK/holiday-$NEXT_YEAR.json" "" \
+      "https://$_mirror.jsdelivr.net/gh/NateScarlet/holiday-cn@master/$NEXT_YEAR.json" \
+      && HOLIDAY_NEXT="$WORK/holiday-$NEXT_YEAR.json" && break || true
+  done
+  unset _mirror
+fi
 
 acquire_lock
 

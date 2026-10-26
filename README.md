@@ -153,13 +153,22 @@ Linux and WSL nothing is rewritten. Two bugs fixed along the way apply everywher
   `C:\tmp` path came out as `C:<TAB>mp`. The palette holds real escape bytes and
   the final print is `%s`.
 
-### Known limitation
+### Concurrency
 
-Python's `fcntl` does not exist on Windows, so the cost/rate accumulator runs
-without a lock there. Concurrent renders — a hook firing while the status line
-refreshes, or two sessions at once — can then lose one session's update. On Linux
-the same race was measured at 12 of 12 trials, which is why the lock exists.
-Fixing it needs `msvcrt.locking`; it is a known gap, not a correctness guarantee.
+The cost and rate accumulators share one state file, and a render rewrites it.
+Two renders at once — a second session, or the status line refreshing while
+another one starts — would otherwise load the same map, both save, and the
+second save would drop the first session's cost and rate. A lock serialises
+them: `flock` on POSIX, `msvcrt.locking` on Windows. Both are advisory locks
+between cooperating processes, which is all this needs.
+
+That lock is held across the whole render — load, transcript scan, save — because
+holding it only around the save would still let a second render load, save, and
+then be overwritten by a stale copy. Both accumulators write one entry and the
+file is written once per render, not twice.
+
+The one thing that can still lose an update is a platform with neither locking
+primitive, where the code proceeds unlocked rather than failing the render.
 
 The general risk here is failure that looks like success: a wrong-looking path
 that nobody reads closely, a hook that exits 0 without scoring, a stub

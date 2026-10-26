@@ -96,7 +96,76 @@ render:
 - Node.js 20+
 - Claude Code CLI (`claude`)
 - `jq` (for status line rendering)
+- Python 3 — optional; without it the bar shows Claude Code's own cost figure and omits the output rate
 - **Dark terminal theme** — pixel creatures use Unicode block characters that are invisible on light backgrounds
+
+## Windows and WSL
+
+Works on macOS, Linux, WSL and native Windows. One set of bash scripts, no
+platform branch at runtime — the differences are handled where they exist, so a
+fix on one platform does not have to be repeated on the other.
+
+### Windows
+
+Needs **Git Bash** (from [Git for Windows](https://git-scm.com/download/win)) and
+`jq`. Run `./install.sh` from Git Bash. Claude Code runs status line and hook
+commands through Git Bash when it is installed, so the scripts run unchanged; what
+the installer adapts is the paths it writes into `settings.json`.
+
+- **Paths are written with forward slashes** (`C:/Users/you/.claude/...`). A
+  backslash path is mangled before it reaches the shell — Git Bash reads `\U`,
+  `\a`, `\c` as escapes, so `C:\Users\ada\.claude\settings.json` arrives as
+  `C:Usersada.claudesettings.json`. Claude Code's own docs warn about the same
+  thing for `statusLine.command`.
+- **jq**: `winget install jqlang.jq` or `choco install jq`. It is a hard
+  dependency, and it fails quietly — without it the bar still renders, with every
+  field empty rather than an error.
+- **Python** is the dependency most likely to be a stub: the Microsoft Store
+  `python3` answers `command -v`, prints "Python was not found" and exits 0. The
+  probe asks for a marker on stdout and walks every `python3`/`python` on `PATH`,
+  so one stub does not hide a working interpreter behind it.
+- **Terminal encoding**: the bar uses `│`, `⬡` and block characters. Windows
+  Terminal defaults to UTF-8; a legacy console on code page 936 shows `?` instead.
+  Run `chcp 65001` if you see that.
+- **Symbolic links**: the installer links the data and helper files so they follow
+  the checkout. Windows refuses symlinks to a normal user without Developer Mode,
+  so it falls back to a directory junction (`mklink /J`, which needs no elevation
+  and covers the `/pet` skill directory) and then to a copy — and lists the ones
+  it copied, since those need a reinstall to pick up changes.
+
+### WSL
+
+Treated as Linux throughout. Paths under `/mnt/c/...` are real Linux paths and are
+never reinterpreted as Windows drive letters — the normalisation below only
+touches paths that begin with a drive letter.
+
+### What the code does about it
+
+The status line folds the three ways Windows spells one directory
+(`C:\Users\me\proj`, `C:/Users/me/proj`, `/c/Users/me`) into one form before
+comparing, which is what makes the repo-relative and `~` prefixes work there. On
+Linux and WSL nothing is rewritten. Two bugs fixed along the way apply everywhere:
+
+- the hook read its stdin from `/dev/stdin`, which does not exist on Windows, so
+  the open failed, the error was swallowed and no prompt was ever scored — it
+  reads fd 0 now;
+- the status line printed through `printf %b`, which interprets escapes, so a
+  `C:\tmp` path came out as `C:<TAB>mp`. The palette holds real escape bytes and
+  the final print is `%s`.
+
+### Known limitation
+
+Python's `fcntl` does not exist on Windows, so the cost/rate accumulator runs
+without a lock there. Concurrent renders — a hook firing while the status line
+refreshes, or two sessions at once — can then lose one session's update. On Linux
+the same race was measured at 12 of 12 trials, which is why the lock exists.
+Fixing it needs `msvcrt.locking`; it is a known gap, not a correctness guarantee.
+
+The general risk here is failure that looks like success: a wrong-looking path
+that nobody reads closely, a hook that exits 0 without scoring, a stub
+interpreter that exits 0 without running. Each of those shipped once. The tests
+for this area therefore assert on an observable effect (a file written, a rate
+displayed) rather than on the absence of an error message.
 
 ## Uninstall
 

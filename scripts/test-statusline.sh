@@ -550,6 +550,217 @@ check "info.show=false keeps the pet"  "$(count_in 'Pet: ◆' "$bar")" "1"
 out="$(info_render "$(jq -c '.display = false | .info = {show: false}' <<< "$INFO_BASE")")"
 check "both switches off print nothing at all" "${#out}" "0"
 
+# ── Windows portability ──────────────────────────────────────────────────────
+# These three were found on a real Windows box; the first two are bugs on any
+# platform, the third was invisible on Linux because no path there has a
+# backslash.
+
+# printf %b interprets escapes, so a Windows path lost its separators before
+# reaching the terminal: C:\tmp arrived as C:<TAB>mp. The final print is %s now
+# and the palette holds real ESC bytes instead of the text \033. The payload is
+# built by jq so the backslashes reach it as JSON escapes, not as shell input.
+#
+# Reset the config first: the peak tests above leave info.show=false behind, and
+# a bar that is switched off prints nothing — which would look like a failure
+# here rather than the deliberate silence it is.
+printf '%s' '{"display":true}' > "$PET_DIR/config.json"
+WIN_PAYLOAD="$(jq -cn --arg dir 'C:\tmp\projects' '{
+  model:{display_name:"m",id:"m"}, session_id:"w",
+  workspace:{current_dir:$dir},
+  context_window:{used_percentage:5,context_window_size:200000,
+    current_usage:{input_tokens:1,cache_creation_input_tokens:0,
+                   cache_read_input_tokens:1,output_tokens:1}},
+  cost:{total_cost_usd:0.01}}')"
+win_raw="$(HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" <<< "$WIN_PAYLOAD" 2>/dev/null)"
+win_out="$(sed 's/\x1b\[[0-9;]*m//g' <<< "$win_raw")"
+# pnorm now folds the backslashes to forward slashes on purpose, so the path
+# that reaches the bar is C:/tmp/projects. What this guards is the older bug:
+# printf %b read \t as a tab and printed "C:<TAB>mp". Either spelling is fine
+# here, a tab is not.
+nocheck "a backslash path does not become a tab"  "$win_out" 'C:	mp'
+check   "the whole Windows path reaches the bar"  "$win_out" '/tmp/projects'
+
+# The palette must be real ESC bytes, or switching the final print to %s would
+# have left the colours on screen as literal text "\033[38;5;245m".
+check "the palette is real escape bytes" \
+  "$(grep -c '\\033' <<< "$win_raw")" "0"
+check "and the ESC byte is actually there" \
+  "$([[ "$win_raw" == *$'\033'* ]] && echo yes || echo no)" "yes"
+
+# `command -v python3` accepts the Microsoft Store stub, which prints "Python
+# was not found" and exits 0. Two things have to hold, and neither is proved by
+# looking for the stub's message (the script sends stderr to /dev/null):
+#
+#   1. a stub earlier in PATH must not hide a working interpreter later in it —
+#      `command -v` stops at the first match, so the probe has to enumerate;
+#   2. with no working interpreter at all, the block is skipped rather than
+#      entered-and-failed.
+#
+# The observable split is cost-state.json plus the cost figure: the accumulators
+# are python-only, and a failed estimate falls back to the payload's number.
+STUB_BIN="$TMP/stub-bin"
+mkdir -p "$STUB_BIN"
+printf '#!/bin/sh\necho "Python was not found; run without arguments to install from the Microsoft Store"\nexit 0\n' \
+  > "$STUB_BIN/python3"
+chmod +x "$STUB_BIN/python3"
+printf '%s' '{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{"models":{"m":{"input_per_mtok":1,
+  "output_per_mtok":2,"cache_read_per_mtok":0.1}}}}' > "$PET_DIR/config.json"
+rm -f "$PET_DIR/cost-state.json"
+stub_out="$(HOME="$TMP" PATH="$STUB_BIN:$PATH" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 \
+  PET_PRICING_COST=1 bash "$SL" <<< "$WIN_PAYLOAD" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+nocheck "the Store python stub's noise never reaches the bar" "$stub_out" "Python was not found"
+check   "the bar still renders with a stub on PATH"           "$stub_out" "⬡ m"
+check   "a stub does not hide the real python behind it" \
+  "$([[ -f "$PET_DIR/cost-state.json" ]] && echo written || echo missing)" "written"
+# The payload claims 0.01; the card prices this request at ~0.000003, so the
+# figure proves the estimate ran instead of falling back.
+nocheck "and the cost is the estimate, not the fallback" "$stub_out" '$0.0100'
+
+# With no working interpreter reachable, the block must be skipped: nothing
+# written, nothing on stderr, and the payload's own number in the bar. PATH has
+# to be only the stubs — pointing it at /usr/bin keeps a real python reachable
+# and would test nothing. The few utilities the script needs first are copied in.
+NOSH="$TMP/no-python"
+mkdir -p "$NOSH"
+for n in python3 python; do
+  printf '#!/bin/sh\necho "Python was not found"\nexit 0\n' > "$NOSH/$n"
+  chmod +x "$NOSH/$n"
+done
+# bash itself must be reachable (the script is invoked as `bash "$SL"`), along
+# with the utilities it forks. `command -v` may answer with a bare name for a
+# shell builtin, so only absolute paths are copied.
+for u in bash jq awk sed grep cat mktemp tr head wc cut which printenv; do
+  p=$(command -v "$u" 2>/dev/null) || continue
+  [[ "$p" == /* && -f "$p" ]] && cp "$p" "$NOSH/" 2>/dev/null
+done
+rm -f "$PET_DIR/cost-state.json"
+nopy_out="$(HOME="$TMP" PATH="$NOSH" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 \
+  PET_PRICING_COST=1 bash "$SL" <<< "$WIN_PAYLOAD" 2>"$TMP/nopy.err" | sed 's/\x1b\[[0-9;]*m//g')"
+check "without a real python nothing is written" \
+  "$([[ -f "$PET_DIR/cost-state.json" ]] && echo written || echo missing)" "missing"
+check "and stderr stays empty"  "$(cat "$TMP/nopy.err")" ""
+check "and the bar falls back to the payload's cost" "$nopy_out" '$0.0100'
+
+# ── path normalisation (Windows + WSL) ───────────────────────────────────────
+# On Windows the same directory arrives in three shapes that never compare
+# equal: Claude Code reports C:\Users\me\proj, git answers C:/Users/me/proj, and
+# Git Bash's HOME is /c/Users/me. The repo-root and ~ prefixes both missed, so
+# the directory segment fell back to a full absolute path. pnorm folds the
+# drive-letter spellings together and leaves every POSIX path alone — WSL's
+# /mnt/c/... is a real Linux path and must not be read as a drive letter.
+pnorm_fn() {
+  bash -c '
+    source <(sed -n "/^pnorm() {/,/^}/p" "'"$SL"'")
+    pnorm "$1"
+  ' _ "$1"
+}
+check "backslash path is folded to forward slashes" \
+  "$(pnorm_fn 'E:\local-ai\proj')" "E:/local-ai/proj"
+check "an already-forward path is unchanged" \
+  "$(pnorm_fn 'E:/local-ai/proj')" "E:/local-ai/proj"
+check "drive-relative C:proj becomes C:/proj" \
+  "$(pnorm_fn 'C:proj')" "C:/proj"
+check "WSL /mnt/c is left alone" \
+  "$(pnorm_fn '/mnt/c/Users/me')" "/mnt/c/Users/me"
+check "a POSIX path is left alone" \
+  "$(pnorm_fn '/home/ada/x')" "/home/ada/x"
+check "root survives" "$(pnorm_fn '/')" "/"
+check "a drive root survives" "$(pnorm_fn 'C:/')" "C:/"
+
+# The dir segment folds both sides before comparing, so a cwd whose separators
+# differ from git's answer still resolves to repo-relative form. A real repo is
+# used — an env override would only test the variable, not the comparison.
+WINREPO="$TMP/winrepo"
+mkdir -p "$WINREPO/sub"
+git -C "$WINREPO" init -q 2>/dev/null
+printf '%s' '{"display":true,"info":{"hide":["context","cache","out","cost","duration","lines"]}}' \
+  > "$PET_DIR/config.json"
+repo_out="$(HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" <<< "$(jq -cn --arg dir "$WINREPO/sub" '{
+    model:{display_name:"m",id:"m"}, session_id:"d",
+    workspace:{current_dir:$dir},
+    context_window:{used_percentage:5,context_window_size:200000,
+      current_usage:{input_tokens:1,cache_creation_input_tokens:0,
+                     cache_read_input_tokens:1,output_tokens:1}},
+    cost:{total_cost_usd:0.01}}')" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+check "a repo-relative dir is shown, not the absolute path" \
+  "$repo_out" "winrepo/sub"
+# The ~ prefix must fold too: HOME and the path both reach fmt_dir in whatever
+# spelling the platform gave them.
+home_out="$(HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" <<< "$(jq -cn --arg dir "$TMP/plain/dir" '{
+    model:{display_name:"m",id:"m"}, session_id:"h",
+    workspace:{current_dir:$dir},
+    context_window:{used_percentage:5,context_window_size:200000,
+      current_usage:{input_tokens:1,cache_creation_input_tokens:0,
+                     cache_read_input_tokens:1,output_tokens:1}},
+    cost:{total_cost_usd:0.01}}')" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+check "a path under HOME is shown with ~" "$home_out" "~/plain/dir"
+
+# The cases above pass on Linux with or without the folding, because a POSIX
+# path is already in the folded form. These drive fmt_dir directly with the
+# mixed spellings only Windows produces, which is what the folding is for.
+fmt_case() { # $1 = HOME, $2 = dir, $3 = repo root
+  bash -c '
+    source <(sed -n "/^pnorm() {/,/^}/p" "'"$SL"'")
+    source <(sed -n "/^pnorm_msys() {/,/^}/p" "'"$SL"'")
+    source <(sed -n "/^fmt_dir() {/,/^}/p" "'"$SL"'")
+    HOME="$1" fmt_dir "$2" "$3"
+  ' _ "$1" "$2" "$3"
+}
+check "backslash cwd vs forward git root folds together" \
+  "$(fmt_case 'C:/Users/me' 'E:\local-ai\proj\src' 'E:/local-ai/proj')" "proj/src"
+check "backslash cwd under a drive-letter HOME gets ~" \
+  "$(fmt_case 'C:/Users/me' 'C:\Users\me\work\thing' '')" "~/work/thing"
+check "WSL cwd and root are compared untouched" \
+  "$(fmt_case '/home/me' '/mnt/c/work/proj/sub' '/mnt/c/work/proj')" "proj/sub"
+check "WSL path under HOME still collapses to ~" \
+  "$(fmt_case '/home/me' '/home/me/x/y' '')" "~/x/y"
+
+# The projects/<name> Claude Code derives replaces every non-alphanumeric
+# character, not just slashes — so a Windows path keeps a double dash where the
+# drive colon was. Replacing only '/' left the name untouched and the transcript
+# was never found. Exercised through the rate, which is the only reader.
+#
+# Direct check of the rule, independent of any file lookup.
+python3 -c '
+import re, sys
+cases = [
+    ("E:\\local-ai\\claude\\proj", "E--local-ai-claude-proj"),
+    ("C:\\Users\\me\\my_proj.v2",  "C--Users-me-my-proj-v2"),
+    ("/mnt/c/Users/me/proj",       "-mnt-c-Users-me-proj"),
+    ("/home/ada/x",                "-home-ada-x"),
+]
+bad = [(p, re.sub(r"[^A-Za-z0-9]", "-", p), w) for p, w in cases
+       if re.sub(r"[^A-Za-z0-9]", "-", p) != w]
+for p, got, w in bad:
+    print("  FAIL project dir for %r: got %r want %r" % (p, got, w))
+sys.exit(1 if bad else 0)
+' && ok "the project dir name replaces every non-alphanumeric" \
+  || { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "the project dir name replaces every non-alphanumeric"; }
+
+# And end to end: a transcript filed under the Windows-derived name must be
+# found from a Windows-style cwd, so the rate appears. It is placed one level
+# deeper than the glob looks, i.e. NOT at projects/<name>/<session>.jsonl, so
+# only the exact-path branch can find it — otherwise the glob fallback would
+# rescue the wrong rule and the test would pass either way.
+WINPROJ_DIR="$TMP/claude-config/projects/E--local-ai-proj"
+mkdir -p "$WINPROJ_DIR"
+add_pair WP wq1 wm1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+cp "$TRANSCRIPTS/WP.jsonl" "$WINPROJ_DIR/WP.jsonl"
+winrate="$(HOME="$TMP" CLAUDE_CONFIG_DIR="$TMP/claude-config" \
+  PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+  bash "$SL" <<< "$(jq -cn --arg dir 'E:\local-ai\proj' '{
+    model:{display_name:"m",id:"m"}, session_id:"WP",
+    workspace:{current_dir:$dir},
+    context_window:{used_percentage:5,context_window_size:200000,
+      current_usage:{input_tokens:1,cache_creation_input_tokens:0,
+                     cache_read_input_tokens:1,output_tokens:1}},
+    cost:{total_cost_usd:0.01}}')" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+check "a transcript under a Windows-derived project dir is found" \
+  "$winrate" "100.0 tok/s"
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

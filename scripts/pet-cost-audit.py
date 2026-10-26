@@ -38,8 +38,14 @@ def projects_root() -> Path:
 
 
 def project_dir_for(cwd: str) -> Path:
-    """Claude Code names a project dir by replacing every '/' in the cwd with '-'."""
-    return projects_root() / cwd.replace("/", "-")
+    """The projects/<name> Claude Code derives from a working directory.
+
+    Every character other than a letter or digit becomes '-', so a Windows path
+    keeps a double dash where the drive colon used to be:
+    C:\\Users\\me\\proj -> C--Users-me-proj. Replacing only '/' left a Windows
+    path untouched and found nothing.
+    """
+    return projects_root() / re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
 
 
 def find_transcript(session: str | None, project: str | None) -> Path:

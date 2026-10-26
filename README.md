@@ -255,7 +255,9 @@ DeepSeek charges two tariffs: peak is Mon–Fri **01:00–04:00 and 06:00–10:0
 
 The status line prices each request at the tariff in force and marks the running total with **谷** (off-peak) or **峰** (peak). Hide the marker with `"currency": { "show_tier": false }` or `PET_COST_TIER_LABEL=0`.
 
-If your gateway does **not** follow DeepSeek's schedule, override it — either pin the tariff, or replace a model's card with your own flat or tiered rates (`"source": "user"` entries are never overwritten by a refresh):
+If your gateway does **not** follow DeepSeek's schedule, override it — either pin
+the tariff, or replace a model's card with your own rates (`"source": "user"`
+entries are never overwritten by a refresh):
 
 ```json
 { "pricing": {
@@ -265,6 +267,33 @@ If your gateway does **not** follow DeepSeek's schedule, override it — either 
         "off_peak": { "input_per_mtok": 0.15, "output_per_mtok": 0.60, "cache_read_per_mtok": 0.003 },
         "peak":     { "input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006 } } } } }
 ```
+
+A gateway that bills a **flat** rate needs no `peak`/`off_peak` pair — give it the
+one rate and no tier is ever applied:
+
+```json
+{ "pricing": { "models": {
+    "deepseek-v4.1-flash": { "source": "user", "context_tokens": 1048576,
+      "input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006 } } } }
+```
+
+Two models can look alike and bill very differently. A gateway may expose the same
+underlying model twice — under its own name at DeepSeek's tiered rate, and as a
+resold alias at a flat markup:
+`deepseek-v4-flash` and `deepseek-v4.1-flash` are not interchangeable. Check what
+your provider actually charges rather than assuming, because the aliases are
+frequently *not* the official card:
+
+| Rate seen | What it is |
+| - | - |
+| `$0.15 / $0.60 / $0.003` | DeepSeek off-peak |
+| `$0.30 / $1.20 / $0.006` | DeepSeek peak — also what a reseller billing "peak, always" charges |
+| something much cheaper on input and dearer on output | a reseller's own margin, not a DeepSeek rate at all |
+
+The third shape is worth catching: it looks like a bargain on the input side and
+bills more for everything the model writes. OpenRouter's catalogue is a useful
+approximation for models you cannot price otherwise, but it is not what a given
+gateway charges.
 
 ### Context window size
 

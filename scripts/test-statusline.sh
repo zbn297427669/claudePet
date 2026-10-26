@@ -780,6 +780,17 @@ check "WSL cwd and root are compared untouched" \
 check "WSL path under HOME still collapses to ~" \
   "$(fmt_case '/home/me' '/home/me/x/y' '')" "~/x/y"
 
+# Elision must keep whatever anchors the path. POSIX paths are anchored by the
+# leading "/", Windows ones by the drive letter; the elided branch used to print
+# a bare "/" either way, so E:/a/b/c/d came out as /…/b/c — a path that does not
+# exist, with the drive silently gone.
+check "a deep Windows path elides but keeps its drive letter" \
+  "$(fmt_case '/home/me' 'E:\a\b\c\d' '')" "E:/…/c/d"
+check "a short Windows path is shown whole" \
+  "$(fmt_case '/home/me' 'E:\local-ai\claude\claudePet' '')" "E:/local-ai/claude/claudePet"
+check "a deep POSIX path still elides to a leading slash" \
+  "$(fmt_case '/home/me' '/opt/x/y/z' '')" "/…/y/z"
+
 # The projects/<name> Claude Code derives replaces every non-alphanumeric
 # character, not just slashes — so a Windows path keeps a double dash where the
 # drive colon was. Replacing only '/' left the name untouched and the transcript

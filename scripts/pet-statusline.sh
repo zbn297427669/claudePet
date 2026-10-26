@@ -854,14 +854,28 @@ fmt_dir() {
   else
     prefix=""; shown="$dir"
   fi
-  # Pure bash (no tr/wc/awk forks): strip every non-slash to count the depth
+  # Pure bash (no tr/wc/awk forks): strip every non-slash to count the depth.
+  # A drive letter is not a separator, so E:/a/b/c counts 3 — the same depth as
+  # /a/b/c — which is what makes the elision below trigger at the same point on
+  # both platforms.
   slashes="${shown//[!\/]/}"
+  # Without a prefix the first segment is what anchors the path: "/" on POSIX,
+  # "E:" on Windows. Dropping it turned E:/a/b/c into /…/b/c, i.e. a path that
+  # does not exist.
+  anchor=""
+  if [[ -z "$prefix" ]]; then
+    if [[ "$shown" =~ ^[A-Za-z]:/ ]]; then
+      anchor="${shown:0:2}"                       # E:
+      shown="${shown:2}"
+      slashes="${slashes#/}"
+    fi
+  fi
   if (( ${#slashes} > 2 )); then
     parent="${shown%/*}"; parent="${parent##*/}"
     leaf="${shown##*/}"
-    printf '%s/…/%s/%s' "$prefix" "$parent" "$leaf"
+    printf '%s%s/…/%s/%s' "$prefix" "$anchor" "$parent" "$leaf"
   else
-    printf '%s%s' "$prefix" "$shown"
+    printf '%s%s%s' "$prefix" "$anchor" "$shown"
   fi
 }
 DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")

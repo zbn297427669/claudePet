@@ -182,6 +182,38 @@ run_updater "$CFG" "$FIX/docs-swapped.html" "$FIX/holiday2026.json" >/dev/null
 check "swapped columns rejected" "$(q "$CFG" '.pricing.models["deepseek-flash"].source')" "deepseek-builtin"
 check "rejected page did not corrupt prices" "$(q "$CFG" '.pricing.models["deepseek-flash"].off_peak.input_per_mtok')" "0.15"
 
+# ── python detection ─────────────────────────────────────────────────────────
+# On Windows the Microsoft Store stub answers `command -v`, prints "Python was
+# not found" and exits 0. The updater used to bail on that check alone, so it
+# exited 0 having done nothing — invisible, because a background updater that
+# does nothing looks exactly like one with nothing to update.
+# Both updaters share the probe, so both are checked.
+STUB="$WORK/stub"; CORE="$WORK/core"
+mkdir -p "$STUB" "$CORE"
+printf '#!/bin/sh\necho "Python was not found; run without arguments to install from the Microsoft Store"\nexit 0\n' \
+  > "$STUB/python3"
+cp "$STUB/python3" "$STUB/python"
+chmod +x "$STUB/python3" "$STUB/python"
+# Only the utilities the probe itself needs — no python anywhere.
+for u in bash which sed grep cat; do
+  p=$(command -v "$u" 2>/dev/null) || continue
+  [[ "$p" == /* && -f "$p" ]] && cp "$p" "$CORE/" 2>/dev/null
+done
+
+probe_of() { # $1 = script → prints the resolved interpreter, or "rejected"
+  env -i PATH="$1" bash -c '
+    source <(sed -n "/^have_python()/,/^}/p" "'"$2"'")
+    have_python || echo rejected
+  '
+}
+for script in "$UPDATER" "$ROOT/scripts/update-fx-rate.sh"; do
+  name=$(basename "$script")
+  check "$name: the Store stub is rejected" \
+    "$(probe_of "$STUB:$CORE" "$script")" "rejected"
+  check "$name: a real python behind the stub is still found" \
+    "$(probe_of "$STUB:$CORE:/usr/bin" "$script")" "/usr/bin/python3"
+done
+
 echo
 if (( FAIL > 0 )); then
   printf '  %d passed, %d FAILED\n' "$PASS" "$FAIL"

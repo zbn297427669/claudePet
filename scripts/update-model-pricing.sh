@@ -36,7 +36,29 @@ UA='Mozilla/5.0 (compatible; claude-pet)'
 
 command -v curl >/dev/null 2>&1 || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
-command -v python3 >/dev/null 2>&1 || exit 0
+
+# Which python actually runs. `command -v python3` is not enough on Windows: the
+# Microsoft Store stub sits on PATH, answers the lookup, prints "Python was not
+# found" and exits 0 — so the check passed and the real work silently did
+# nothing. Require a known marker on stdout, and walk every candidate on PATH so
+# one stub earlier in it cannot hide a working interpreter behind it.
+have_python() {
+  local n all p
+  for n in python3 python; do
+    if all=$(which -a "$n" 2>/dev/null); then
+      while IFS= read -r p; do
+        [[ -n "$p" && -x "$p" ]] || continue
+        [[ "$("$p" -c 'import sys;sys.stdout.write("PETPY")' 2>/dev/null)" == "PETPY" ]] && { printf '%s' "$p"; return 0; }
+      done <<< "$all"
+    else
+      p=$(command -v "$n" 2>/dev/null) || continue
+      [[ -n "$p" && -x "$p" ]] || continue
+      [[ "$("$p" -c 'import sys;sys.stdout.write("PETPY")' 2>/dev/null)" == "PETPY" ]] && { printf '%s' "$p"; return 0; }
+    fi
+  done
+  return 1
+}
+PY=$(have_python) || exit 0
 
 # Ensure config exists (minimal) so first-run can seed pricing
 if [[ ! -f "$CONFIG" ]]; then
@@ -49,7 +71,7 @@ needs_update() {
   local updated
   updated=$(jq -r '.pricing.updated_at // empty' "$CONFIG" 2>/dev/null || true)
   [[ -z "$updated" ]] && return 0
-  python3 - "$updated" "$TTL_HOURS" <<'PY'
+  "$PY" - "$updated" "$TTL_HOURS" <<'PY'
 import sys, datetime as dt
 raw, hours = sys.argv[1], float(sys.argv[2])
 try:
@@ -163,7 +185,7 @@ pet_fetch "$WORK/holiday-$NEXT_YEAR.json" "" \
 
 acquire_lock
 
-python3 - "$CONFIG" "$CATALOG" "$DOCS" "$HOLIDAY_CUR" "$HOLIDAY_NEXT" \
+"$PY" - "$CONFIG" "$CATALOG" "$DOCS" "$HOLIDAY_CUR" "$HOLIDAY_NEXT" \
   "${CCR_DIR_FOUND:-}" "${PET_PRICING_WATCH:-}" "$CUR_YEAR" "$NEXT_YEAR" <<'PY'
 import json, os, re, sys, shutil, sqlite3, tempfile
 from datetime import datetime, timezone

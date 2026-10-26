@@ -21,7 +21,10 @@ const DATA_DIR = resolve(homedir(), ".claude", "claude-pet");
 function readPrompt() {
   let raw = "";
   try {
-    raw = readFileSync("/dev/stdin", "utf-8").trim();
+    // fd 0, not "/dev/stdin": that path does not exist on Windows, where the
+    // open fails with ENOENT, the catch below swallows it, and the hook then
+    // scores nothing while still exiting 0 — no XP, no error log, no trace.
+    raw = readFileSync(0, "utf-8").trim();
   } catch {
     return "";
   }

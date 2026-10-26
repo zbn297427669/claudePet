@@ -74,14 +74,41 @@ IFS=$'\x1f' read -r \
 # Optional local $/MTok estimate (auto-updated); may undercount — see README
 COST_STATE="$PET_DIR/cost-state.json"
 COST_TIER=""   # set to peak/off_peak when the model carries a peak/off-peak card
+# Which python actually runs. `command -v` is not enough, and neither is the
+# exit status: on Windows the Microsoft Store stub sits on PATH, answers the
+# lookup, prints "Python was not found" and exits 0. So require a known marker
+# on stdout — that is the only signal a stub cannot fake.
+#
+# Every candidate on PATH is tried, not just the first of each name. `command -v`
+# stops at the first match, so one stub earlier in PATH would hide a working
+# interpreter later in it; `which -a` lists them all (Git Bash ships it, and
+# elsewhere a missing `which` just falls back to the single `command -v` answer).
+_py_candidates() {
+  local n all p
+  for n in python3 python; do
+    if all=$(which -a "$n" 2>/dev/null); then
+      while IFS= read -r p; do [[ -n "$p" && -x "$p" ]] && printf '%s\n' "$p"; done <<< "$all"
+    else
+      p=$(command -v "$n" 2>/dev/null) && [[ -n "$p" && -x "$p" ]] && printf '%s\n' "$p"
+    fi
+  done
+}
+PET_PY=""
+while IFS= read -r _cand; do
+  [[ -n "$_cand" ]] || continue
+  if [[ "$("$_cand" -c 'import sys;sys.stdout.write("PETPY")' 2>/dev/null)" == "PETPY" ]]; then
+    PET_PY="$_cand"; break
+  fi
+done <<< "$(_py_candidates)"
+unset _cand
 # The block below serves two independent features: the priced cost estimate
 # (PET_PRICING_COST) and the output rate (PET_OUTPUT_RATE). Run it when either
 # is wanted — gating both on the pricing switch would silently take the rate
 # down with it.
 if { [[ "${PET_PRICING_COST:-1}" != "0" ]] || [[ "${PET_OUTPUT_RATE:-1}" != "0" ]]; } \
-   && [[ -f "$PET_CONFIG" ]] && command -v python3 >/dev/null 2>&1; then
+   && [[ -f "$PET_CONFIG" ]] && [[ -n "$PET_PY" ]]; then
   COST_CUSTOM=$(
-    PET_COST_STATE="$COST_STATE" python3 - "$PET_CONFIG" \
+    PET_COST_STATE="$COST_STATE" "$PET_PY" - "$PET_CONFIG" \
       "${MODEL_ID:-}" "${MODEL:-}" "${SESSION_ID:-}" \
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
       "${COST:-0}" "${DIR:-}" <<'PY'
@@ -237,15 +264,27 @@ def projects_root() -> Path:
     return Path(base) / "projects"
 
 
+def project_dir_name(cwd: str) -> str:
+    """The projects/<name> Claude Code derives from a working directory.
+
+    Documented rule: every character other than a letter or digit becomes '-'.
+    That matters on Windows, where the colon and each backslash are replaced
+    too — C:\\Users\\me\\my_proj.v2 becomes C--Users-me-my-proj.v2, with the
+    double dash from ':' and '\\'. Linux and WSL paths survive it unchanged
+    because they already consist only of letters, digits and slashes.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
+
+
 def transcript_for(session_id: str, cwd: str):
-    """The session's .jsonl, or None. Claude Code names the project directory
-    after the cwd with every '/' replaced by '-'; fall back to any project
-    because the cwd can change after a session starts (e.g. /add-dir)."""
+    """The session's .jsonl, or None. The exact directory name is tried first,
+    then any project (the cwd can change after a session starts, e.g. /add-dir),
+    then the transcript's own siblings by session id."""
     if not session_id or session_id == "default":
         return None
     root = projects_root()
     try:
-        exact = root / (cwd or "").replace("/", "-") / f"{session_id}.jsonl"
+        exact = root / project_dir_name(cwd) / f"{session_id}.jsonl"
         if exact.is_file():
             return exact
         for cand in root.glob(f"*/{session_id}.jsonl"):
@@ -673,13 +712,57 @@ fmt_tokens() {
 # ── Dir + git branch (one git call) ──────────────────────────────────────────
 # In a repo:  repo root name + subpath            →  claudePet/src/engine
 # Otherwise:  last two segments, elision marked   →  ~/…/claude/claudePet
-# --show-toplevel goes first: on an unborn branch --abbrev-ref fails (exit 128)
-# and aborts the remaining args, which would drop the repo root too.
-GIT_DIR="$DIR"
+#
+# Paths arrive in up to three shapes on Windows and none of them compare equal:
+# Claude Code reports the cwd as C:\Users\me\proj (backslashes), git answers
+# C:/Users/me/proj (forward slashes), and Git Bash's HOME is /c/Users/me (MSYS).
+# So the repo-root and ~ prefixes below missed on every Windows machine and the
+# directory fell back to a full absolute path. pnorm folds all three into the
+# forward-slash form before any comparison.
+#
+# On Linux and in WSL nothing is rewritten: a leading / is already the right
+# shape, and /mnt/c/... is a real Linux path that must not be mistaken for a
+# drive letter. Only paths that open with X:/ or X:\ are converted.
+pnorm() { # $1 = path → forward-slash form, drive letter preserved
+  local p="${1:-}" unc=""
+  [[ -n "$p" ]] || { printf '%s' ""; return 0; }
+  # A path already in //server/share form keeps both leading slashes; the
+  # backslash spelling (\\server\share) is left alone rather than guessed at —
+  # Claude Code reports drive-letter paths, so it is not worth the risk.
+  if [[ "$p" == //* ]]; then unc="/"; p="${p#/}"; fi
+  # C:\Users\me  →  C:/Users/me   (only a single letter followed by : or :\ )
+  if [[ "$p" =~ ^[A-Za-z]:[\\/] ]]; then
+    p="${p//\\//}"
+  elif [[ "$p" =~ ^[A-Za-z]:[^/\\] ]]; then
+    p="${p:0:1}:/${p:2}"; p="${p//\\//}"      # C:proj → C:/proj
+  fi
+  # Collapse // and strip a trailing /, but keep a bare "C:/" intact
+  while [[ "$p" == *//* ]]; do p="${p//\/\//\/}"; done
+  [[ "$p" == */ && ${#p} -gt 3 ]] && p="${p%/}"
+  p="${unc}${p}"
+  printf '%s' "$p"
+}
+
+# MSYS/Git Bash spells the same directory as /c/Users/me. Convert to C:/… so it
+# can be compared against paths that came from Claude Code. Deliberately keyed
+# on the presence of cygpath: that exists only under MSYS/Cygwin, so WSL and
+# Linux keep /mnt/c/... untouched.
+pnorm_msys() { # $1 = path → the form Claude Code reports, when it can be known
+  local p="${1:-}"
+  [[ -n "$p" ]] || { printf '%s' ""; return 0; }
+  if [[ "$p" =~ ^/[A-Za-z]/ ]] && command -v cygpath >/dev/null 2>&1; then
+    local w
+    w=$(cygpath -m "$p" 2>/dev/null) && p="$w"
+  fi
+  pnorm "$p"
+}
+
+GIT_DIR="$(pnorm "$DIR")"
 REPO_ROOT=""
 BRANCH=""
 while IFS= read -r line; do
-  if [[ "$line" == /* ]]; then REPO_ROOT="$line"   # toplevel is always absolute
+  if [[ "$line" == /* || "$line" =~ ^[A-Za-z]:[\\/] ]]; then
+    REPO_ROOT="$(pnorm "$line")"                   # toplevel is always absolute
   elif [[ -n "$line" ]]; then BRANCH="$line"; fi
 done < <(git -C "$GIT_DIR" rev-parse --show-toplevel --abbrev-ref HEAD 2>/dev/null)
 # Unborn branch (fresh `git init`) reports "HEAD" — resolve the real name
@@ -688,15 +771,18 @@ if [[ "$BRANCH" == "HEAD" ]]; then
 fi
 
 fmt_dir() {
-  local dir="$1" root="$2" rel shown prefix slashes parent leaf
+  local dir root rel shown prefix slashes parent leaf home
+  dir="$(pnorm "$1")"
+  root="$(pnorm "$2")"
+  home="$(pnorm_msys "$HOME")"
   if [[ -n "$root" ]] && [[ "$dir" == "$root" || "$dir" == "$root"/* ]]; then
     rel="${dir#"$root"}"
     printf '%s%s' "${root##*/}" "$rel"
     return 0
   fi
   # Outside a repo: "~" keeps it readable, "/" keeps it absolute
-  if [[ "$dir" == "$HOME" || "$dir" == "$HOME"/* ]]; then
-    prefix="~"; shown="${dir#"$HOME"}"
+  if [[ -n "$home" ]] && [[ "$dir" == "$home" || "$dir" == "$home"/* ]]; then
+    prefix="~"; shown="${dir#"$home"}"
   else
     prefix=""; shown="$dir"
   fi
@@ -862,12 +948,16 @@ if (( CACHE_DENOM > 0 )); then
     CACHE_SEG="cache 0%"
   fi
 fi
-BAR_CLR="\033[38;5;245m"
+BAR_CLR=$'\033[38;5;245m'
 
 # ── ANSI palette ─────────────────────────────────────────────────────────────
-RST="\033[0m"
-GRAY="\033[38;5;245m"
-DIM="\033[38;5;238m"
+# $'…' so these are real ESC bytes, not the four characters \033. The status
+# line is printed with %s (see the end of this file) so that a path like C:\tmp
+# keeps its backslash instead of having \t turned into a tab by %b; that means
+# nothing may rely on printf interpreting escapes any more.
+RST=$'\033[0m'
+GRAY=$'\033[38;5;245m'
+DIM=$'\033[38;5;238m'
 SEP="${DIM} │ ${RST}"
 
 # ── Peak-tariff alert ────────────────────────────────────────────────────────
@@ -876,7 +966,7 @@ SEP="${DIM} │ ${RST}"
 # weekday that is peak. Pre-warning fires just before peak starts, which is the
 # actionable half — it is the moment to decide whether to wait.
 PK_PREFIX=""
-AMBER="\033[1;38;5;214m"
+AMBER=$'\033[1;38;5;214m'
 if [[ "$PK_ENABLED" != "0" && "$INFO_SHOW" != "0" ]]; then
   if (( PK_LOUD )); then
     PK_PREFIX="${AMBER}⚡峰"
@@ -969,11 +1059,11 @@ if [[ "$PET_DISPLAY" = "true" ]] && [[ -f "$PET_STATE" ]] && [[ -f "$PET_SPRITES
     for (( i=0; i<${#SPRITE_LINES[@]}; i++ )); do
       PADDED=$(printf "%-${SPRITE_W}s" "${SPRITE_LINES[$i]}")
       if [[ "$i" -eq 0 ]] && [[ -n "$PET_MSG" ]]; then
-        printf "%b\n" "${GRAY}${PADDED} ${PET_MSG}${RST}"
+        printf "%s\n" "${GRAY}${PADDED} ${PET_MSG}${RST}"
       elif [[ "$i" -eq "$LAST_IDX" ]]; then
-        printf "%b\n" "${GRAY}${PADDED} Pet: ◆ ${PET_NAME:-???}  ♥ ${PET_XP}/${PET_XP_NEXT} XP${RST}"
+        printf "%s\n" "${GRAY}${PADDED} Pet: ◆ ${PET_NAME:-???}  ♥ ${PET_XP}/${PET_XP_NEXT} XP${RST}"
       else
-        printf "%b\n" "${GRAY}${PADDED}${RST}"
+        printf "%s\n" "${GRAY}${PADDED}${RST}"
       fi
     done
   fi
@@ -985,5 +1075,5 @@ fi
 # off leaves an empty status line row (observed): Claude Code reserves that
 # region, so it is not something this script can take back.
 if [[ -n "$L" ]]; then
-  printf "%b\n" "$L"
+  printf "%s\n" "$L"
 fi

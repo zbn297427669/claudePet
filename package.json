@@ -6,7 +6,7 @@
   "main": "dist/server.js",
   "scripts": {
     "generate": "python3 scripts/generate-data.py",
-    "build": "tsc && rm -rf dist/data && cp -r src/data dist/data",
+    "build": "tsc && node scripts/copy-data.js",
     "start": "node dist/server.js",
     "dev": "tsc --watch",
     "test": "npm run test:unit && npm run test:scripts",

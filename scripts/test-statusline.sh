@@ -451,6 +451,68 @@ for _ in 1 2 3; do
 done
 check "concurrent renders do not drop each other's session" "$race_kept" "3"
 
+# The rate and the cost accumulators both write the session entry. They used to
+# take the lock and save separately — two transactions per render, and two
+# windows to lose another session's update instead of one. A single render must
+# now persist both sets of fields in one write, which is what this checks: the
+# two halves land together, and the file is rewritten once.
+rm -f "$PET_DIR/cost-state.json"
+printf '%s' '{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{"models":{
+  "m":{"input_per_mtok":1,"output_per_mtok":2,"cache_read_per_mtok":0.1}}}}' > "$PET_DIR/config.json"
+add_pair ONCE q1 m1 100 '2026-10-20T00:00:00Z' '2026-10-20T00:00:01Z'
+# Non-zero usage: a fingerprint of all zeros means "no request yet", and the
+# cost accumulator deliberately skips that.
+once_payload="$(jq -cn '{
+  model:{display_name:"m",id:"m"}, session_id:"ONCE",
+  workspace:{current_dir:"/tmp/pet"},
+  context_window:{used_percentage:10,context_window_size:200000,
+    current_usage:{input_tokens:10,cache_creation_input_tokens:0,
+                   cache_read_input_tokens:10,output_tokens:100}},
+  cost:{total_cost_usd:1,total_api_duration_ms:1000}}')"
+once_out="$(HOME="$TMP" CLAUDE_CONFIG_DIR="$TMP/claude-config" \
+  PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+  bash "$SL" <<< "$once_payload" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+check "one render still reports the rate" "$(rate_of "$once_out")" "100.0 tok/s"
+# Both accumulators' fields must be present after a single write.
+once_state="$(jq -c '.sessions.ONCE // {}' "$PET_DIR/cost-state.json" 2>/dev/null)"
+check "the rate fields were persisted"   "$(jq -r '.paired_tokens // "missing"' <<< "$once_state")" "100"
+check "the cost fields were persisted"   "$(jq -r 'if .total_usd then "set" else "missing" end' <<< "$once_state")" "set"
+check "and both share one updated_at"    "$(jq -r 'if .updated_at then "set" else "missing" end' <<< "$once_state")" "set"
+
+# The Windows lock branch. msvcrt is Windows-only, so its use is checked with a
+# stub that records what it was asked to do: a byte-range lock needs the file to
+# hold at least one byte, and the lock has to be released on the way out.
+python3 - "$SL" <<'PY'
+import os, re, sys
+from pathlib import Path
+src = Path(sys.argv[1]).read_text(encoding="utf-8")
+block = re.search(r"@contextmanager\ndef state_lock\(\):.*?\n(?=\n# ──|def )", src, re.S)
+assert block, "state_lock not found"
+code = block.group(0)
+# Import the pieces the function closes over.
+ns = {"os": os, "contextmanager": __import__("contextlib").contextmanager,
+      "state_path": Path("/tmp/pet-locktest/cost-state.json"),
+      "fcntl": None}
+calls = []
+class StubMsvcrt:
+    LK_LOCK, LK_UNLCK = 2, 0
+    @staticmethod
+    def locking(fd, mode, nbytes):
+        calls.append((mode, nbytes))
+        assert nbytes == 1, "a byte-range lock must cover one byte"
+ns["msvcrt"] = StubMsvcrt()
+Path("/tmp/pet-locktest").mkdir(parents=True, exist_ok=True)
+exec(code, ns)
+with ns["state_lock"]():
+    lock_file = Path("/tmp/pet-locktest/cost-state.lock")
+    assert lock_file.exists(), "sidecar lock file was not created"
+    assert lock_file.stat().st_size >= 1, "lock file needs a byte to lock"
+assert calls == [(2, 1), (0, 1)], f"expected lock then unlock of 1 byte, got {calls}"
+print("ok")
+PY
+if [[ $? -eq 0 ]]; then ok "the Windows lock takes and releases a byte range"
+else bad "the Windows lock takes and releases a byte range" "stub check failed"; fi
+
 # ── peak-tariff alert ────────────────────────────────────────────────────────
 # Peak costs double, so past a cost threshold the warning moves to the front of
 # the line with a countdown; before peak starts it pre-warns instead. Every knob

@@ -108,9 +108,14 @@ fix on one platform does not have to be repeated on the other.
 ### Windows
 
 Needs **Git Bash** (from [Git for Windows](https://git-scm.com/download/win)) and
-`jq`. Run `./install.sh` from Git Bash. Claude Code runs status line and hook
-commands through Git Bash when it is installed, so the scripts run unchanged; what
-the installer adapts is the paths it writes into `settings.json`.
+`jq`. Run `./install.sh` from Git Bash. See
+[docs/WINDOWS-INSTALL.md](docs/WINDOWS-INSTALL.md) for the failure modes that
+look like success — a missing `jq` renders an empty bar rather than an error,
+and CRLF line endings break the hook while it still exits 0.
+
+Claude Code runs status line and hook commands through Git Bash when it is
+installed, so the scripts run unchanged; what the installer adapts is the paths
+it writes into `settings.json`.
 
 - **Paths are written with forward slashes** (`C:/Users/you/.claude/...`). A
   backslash path is mangled before it reaches the shell — Git Bash reads `\U`,

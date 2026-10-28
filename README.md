@@ -25,7 +25,7 @@ Then restart Claude Code. Your pet appears in the status line.
 ## What You Get
 
 - **Pixel creature** in your status line that evolves through 5 stages
-- **Richer status line metrics** — ASCII context bar with used/size tokens, cache hit rate (`cache 99% · 207k`), output tokens, output rate (`148.0 tok/s`), session duration, and lines changed
+- **Richer status line metrics** — the turn's reasoning effort (`high`, `xhigh`, …), ASCII context bar with used/size tokens, cache hit rate (`cache 99% · 207k`), output tokens, output rate (`148.0 tok/s`), session duration, and lines changed
 - **Prompt scoring** across 5 dimensions (specificity, context, actionability, scope, constraints)
 - **XP system** — better prompts = more XP = faster evolution
 - **9 creature families** — randomly assigned, each with unique personality and voice
@@ -78,9 +78,12 @@ creature only, `/pet info off` hides the numbers only, and both off prints
 nothing at all — which leaves **one empty status line row**, because Claude Code
 reserves that region for whatever the configured statusLine command prints. That
 blank row is the interface's, not the script's: reclaiming it means removing the
-`statusLine` setting rather than hiding more segments. Segments you can hide are `model dir branch context cache out rate
+`statusLine` setting rather than hiding more segments. Segments you can hide are `model effort dir branch context cache out rate
 cost duration lines`; `model` is deliberately not hideable — it is the identity
 of the line — so hiding everything is `/pet info off` rather than a long list.
+`effort` is the current turn's reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`),
+shown right after the model; it is absent on a model that does not support the
+effort parameter, not blank.
 Hiding the bar does **not** stop the cost estimate accumulating, so switching it
 back on shows the session's running total instead of a fresh zero.
 
@@ -88,8 +91,23 @@ The same settings live in `config.json` for hand-editing, and are re-read every
 render:
 
 ```json
-{ "display": true, "info": { "show": true, "hide": ["cache", "out"] } }
+{ "display": true, "info": { "show": true, "hide": ["cache", "out"], "wrap": true } }
 ```
+
+`info.wrap` (default `true`) fits the bar to the terminal: Claude Code renders
+the status line with truncation, so a bar wider than the window lost its tail —
+cost and line counts. With wrapping on, the bar splits at segment boundaries into
+as many lines as it needs, and the last line is padded to the full window width,
+so it sits flush right on the row directly above Claude Code's own `auto mode on`
+footer instead of reading as a left-aligned block stacked on top of it. Nothing
+is dropped and no segment is cut in half. Set it to `false` to keep one line and
+let Claude Code truncate it.
+
+The width comes from `COLUMNS`, which Claude Code passes to the command (it runs
+from a terminal, so the variable is set); `tput cols` is the second source. With
+neither, the bar is printed unchanged rather than guessed at. `PET_INFO_WIDTH`
+overrides both — set it to pin a width by hand, or to `0` to turn fitting off in
+a context where `tput` would otherwise answer.
 
 ## Requirements
 

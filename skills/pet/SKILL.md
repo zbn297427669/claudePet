@@ -27,9 +27,9 @@ Map the argument to an action and run it:
 | anything else | run `... info status`, and mention the valid arguments |
 
 `on`/`off` are about the **creature**; `info` is about the **metrics bar** (model,
-directory, branch, context bar, cache, output tokens, output rate, cost, duration,
-lines changed). They are independent, so "hide the pet but keep the numbers" is
-`off` alone.
+effort, directory, branch, context bar, cache, output tokens, output rate, cost,
+duration, lines changed). They are independent, so "hide the pet but keep the
+numbers" is `off` alone.
 `hide`/`unhide` take comma-separated segment names, and `info hide` with no names
 shows every segment again. The `model` segment is deliberately not hideable — it
 is the identity of the line — so use `info off` to hide the whole bar.

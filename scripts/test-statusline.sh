@@ -46,6 +46,42 @@ nocheck() { # label, haystack, needle
 
 echo "── status line smoke tests ──"
 
+# ── interpreter and env, resolved once for the whole suite ────────────────────
+# Two traps, both of which made this suite fail for reasons that had nothing to
+# do with what it asserts.
+#
+# python3 is not necessarily python. On Windows the Microsoft Store ships a
+# python3.exe that is not an interpreter: it prints "Python was not found" and
+# exits non-zero, so every test that shelled out to python3 reported a failure
+# of the thing under test. The status line itself already probes for a real
+# interpreter — reuse that answer instead of assuming a name.
+PET_PY_TEST=""
+for c in python3 python; do
+  if "$c" -c 'import sys;sys.stdout.write("PETPY")' 2>/dev/null | grep -q PETPY; then
+    PET_PY_TEST="$c"; break
+  fi
+done
+py() { "$PET_PY_TEST" "$@"; }
+[[ -n "$PET_PY_TEST" ]] || { echo "  FAIL no working python interpreter found" >&2; exit 1; }
+
+# COLUMNS must start unset. The status line now fits the bar to the terminal, so
+# a value inherited from the shell running the tests would wrap assertions that
+# expect one line — and whether it leaks depends on how the suite was launched,
+# which is the kind of thing that makes a test pass on one machine only. The
+# fitting cases below set it explicitly.
+unset COLUMNS
+
+# `env` is not necessarily env either. ~/.local/bin/env can be a PATH-fixing
+# shim (uv installs one) whose whole body is an `export PATH=...`: it ignores
+# its arguments, runs nothing, and exits 0. So `env X=1 bash …` silently ran no
+# render at all, and every "must NOT contain" assertion passed for the wrong
+# reason while every "must contain" one failed. Assigning inside a subshell
+# keeps the override and needs no external binary.
+with_env() { # $1 = "VAR=VALUE ..." (may be empty), rest = command
+  local assigns="$1"; shift
+  ( for kv in $assigns; do export "$kv"; done; "$@" )
+}
+
 out="$(render "$STATE_GOOD" '{"display":true}')"
 check "renders the model name"        "$out" "⬡ Sonnet"
 check "renders the context bar"       "$out" "[##--------] 21%"
@@ -98,11 +134,12 @@ cost_payload() { # $1 = model id
 cost_render() { # $1=config json  $2=model  $3=PET_NOW_UTC  $4=extra env
   printf '%s' "$1" > "$PET_DIR/config.json"
   rm -f "$PET_DIR/cost-state.json"     # each case starts a fresh accumulator
-  # env, not a bare ${4:-}: bash only treats assignment words written literally
-  # in the source as assignments, so an expanded one becomes the command name
-  # and the render fails — which a "must NOT contain" assertion cannot see.
+  # with_env, not a bare ${4:-}: bash only treats assignment words written
+  # literally in the source as assignments, so an expanded one becomes the
+  # command name and the render fails — which a "must NOT contain" assertion
+  # cannot see. And not `env` either: see with_env's note.
   HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
-    PET_NOW_UTC="$3" env ${4:-} \
+    PET_NOW_UTC="$3" with_env "${4:-}" \
     bash "$SL" <<< "$(cost_payload "${2:-deepseek-flash}")" 2>/dev/null \
     | sed 's/\x1b\[[0-9;]*m//g'
 }
@@ -121,7 +158,7 @@ check "weekend is off-peak"             "$(cost_render "$CARD_CONFIG" deepseek-f
 check "holiday is off-peak"             "$(cost_render "$CARD_CONFIG" deepseek-flash "$HOLIDAY")" "谷"
 
 # Same request priced on both tariffs: the peak total must be exactly double
-python3 - "$(cost_of "$out_off")" "$(cost_of "$out_peak")" <<'PY'
+py - "$(cost_of "$out_off")" "$(cost_of "$out_peak")" <<'PY'
 import sys
 off, pk = (float(x.lstrip("$")) for x in sys.argv[1:3])
 raise SystemExit(0 if abs(pk - 2 * off) < 0.0002 else 1)
@@ -169,7 +206,7 @@ ctx_payload() { # $1=context_window_size  $2=used_percentage
 ctx_render() { # $1=config  $2=payload window  $3=payload percentage
   printf '%s' "$1" > "$PET_DIR/config.json"
   rm -f "$PET_DIR/cost-state.json"
-  HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+  HOME="$TMP" PET_INFO_WIDTH=0 PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
     PET_NOW_UTC=2026-10-12T05:00:00Z \
     bash "$SL" <<< "$(ctx_payload "$2" "$3")" 2>/dev/null \
     | sed 's/\x1b\[[0-9;]*m//g' | grep -o '\[.*% [0-9.]*[kM]*/[0-9.]*[kM]*'
@@ -215,7 +252,7 @@ check "switching sessions does not wipe A"    "$(jq -r '.sessions.A.total_usd' "
 printf '%s' '{"session_id":"OLD","total_usd":1.5,"last_fp":"1|0|0|0","model":"m"}' > "$PET_DIR/cost-state.json"
 check "the old single-slot file migrates"     "$(sess_render "$FLAT1" OLD 2)" "1.500002"
 
-python3 - "$PET_DIR/cost-state.json" <<'PY'
+py - "$PET_DIR/cost-state.json" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -280,11 +317,12 @@ rate_payload() { # $1=session $2=api ms
 
 rate_run() { # $1=config $2=session $3=api ms $4=extra env
   printf '%s' "$1" > "$PET_DIR/config.json"
-  # env, not a bare ${4:-}: bash only treats assignment words written literally
-  # in the source as assignments, so an expanded one becomes the command name.
+  # with_env, not a bare ${4:-}: bash only treats assignment words written
+  # literally in the source as assignments, so an expanded one becomes the
+  # command name. And not `env` either: see with_env's note.
   HOME="$TMP" CLAUDE_CONFIG_DIR="$TMP/claude-config" \
     PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
-    env ${4:-} \
+    with_env "${4:-}" \
     bash "$SL" <<< "$(rate_payload "$2" "$3")" 2>/dev/null \
     | sed 's/\x1b\[[0-9;]*m//g'
 }
@@ -420,6 +458,183 @@ tail -c +31 "$WHOLE" >> "$TRANSCRIPTS/RF.jsonl"    # the writer finishes it
 check "the response is counted once its line is complete" \
   "$(rate_of "$(rate_run "$RATE_CONFIG" RF 2000)")" "133.3 tok/s"
 
+# ── effort ───────────────────────────────────────────────────────────────────
+# effort.level in the payload is the level Claude Code resolved for the current
+# turn, after any silent downgrade — "max" on a model that cannot take it
+# arrives as "high". The key is absent (not empty) on a model without effort
+# support, so the segment has to vanish rather than render a blank box; the
+# transcript's assistant.effort is the fallback, one response behind. Both the
+# payload and the fallback are checked, plus the precedence between them.
+effort_render() { # $1 = config json, $2 = extra payload members (may be "")
+  printf '%s' "$1" > "$PET_DIR/config.json"
+  jq -cn --arg extra "${2:-}" '{model:{display_name:"m",id:"m"}, session_id:"EFF",
+    workspace:{current_dir:"/tmp/pet"},
+    context_window:{used_percentage:5,context_window_size:200000,
+      current_usage:{input_tokens:1,cache_creation_input_tokens:0,
+                     cache_read_input_tokens:1,output_tokens:1}},
+    cost:{total_cost_usd:0.01}} + ($extra | if . == "" then {} else fromjson end)' \
+  | HOME="$TMP" CLAUDE_CONFIG_DIR="$TMP/claude-config" \
+    PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=1 \
+    bash "$SL" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
+}
+effort_seg() { sed -n 's/.*⬡ m │ \([^│]*\) │.*/\1/p' <<< "$1" | sed 's/ *$//'; }
+
+EFFORT_CONFIG='{"display":true}'
+for lvl in low medium high xhigh max; do
+  check "effort $lvl comes from the payload" \
+    "$(effort_seg "$(effort_render "$EFFORT_CONFIG" "{\"effort\":{\"level\":\"$lvl\"}}")")" "$lvl"
+done
+
+# Same model, no effort key: the segment is gone, and what follows closed up —
+# no empty cell between the model and the directory.
+out="$(effort_render "$EFFORT_CONFIG")"
+check "no effort key leaves the model next to the directory" \
+  "$(sed -n 's/.*⬡ m │ \([^│]*\) │.*/\1/p' <<< "$out" | sed 's/ *$//')" "/tmp/pet"
+
+# The fallback reads the assistant record, and it must not need a paired
+# response: an effort is stated by the record whether or not its api-request
+# survived a compaction, and a change should show up even when the rate cannot.
+rm -f "$PET_DIR/cost-state.json" "$TRANSCRIPTS"/EFF*.jsonl
+jq -cn '{type:"assistant",timestamp:"2026-10-20T00:00:01Z",effort:"medium",
+  message:{id:"e1",usage:{output_tokens:50}}}' >> "$TRANSCRIPTS/EFF.jsonl"
+check "effort falls back to the transcript" \
+  "$(effort_seg "$(effort_render "$EFFORT_CONFIG")")" "medium"
+
+jq -cn '{type:"assistant",timestamp:"2026-10-20T00:00:02Z",effort:"max",
+  message:{id:"e2",usage:{output_tokens:50}}}' >> "$TRANSCRIPTS/EFF.jsonl"
+check "the newest assistant record wins" \
+  "$(effort_seg "$(effort_render "$EFFORT_CONFIG")")" "max"
+
+# The payload describes the turn in progress; the transcript only catches up
+# when that response lands. So the payload has to win, or switching effort would
+# show the old level until the first response came back.
+check "the payload outranks the transcript fallback" \
+  "$(effort_seg "$(effort_render "$EFFORT_CONFIG" '{"effort":{"level":"low"}}')")" "low"
+
+# A state entry written before this feature has no last_effort, and the scan
+# resumes from a persisted offset — so the fallback would find nothing in the
+# bytes it reads. Asserting the payload path here keeps that from looking like a
+# fresh-scan requirement.
+printf '%s' '{"sessions":{"EFF":{"paired_tokens":0,"paired_api_ms":0,
+  "transcript_offset":0,"rate_v":4,"counted_ids":[]}}}' > "$PET_DIR/cost-state.json"
+check "a state entry without last_effort still shows the payload's level" \
+  "$(effort_seg "$(effort_render "$EFFORT_CONFIG" '{"effort":{"level":"high"}}')")" "high"
+
+nocheck "effort is a hideable segment" \
+  "$(effort_render '{"display":true,"info":{"hide":["effort"]}}' '{"effort":{"level":"max"}}')" "max"
+
+# Malformed payload must not take the line down; the effort key simply is not
+# there, and the same empty-object fallback the rest of the bar uses applies.
+out="$(HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" <<< 'not json' 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+check "malformed stdin still renders the bar" "$out" "⬡ Claude"
+nocheck "malformed stdin invents no effort"   "$out" "│ undefined"
+
+# ── fitting the bar to the terminal ──────────────────────────────────────────
+# Claude Code renders the status line with wrap:"truncate", so a bar wider than
+# the window used to lose its tail — cost and line counts, the parts that matter
+# at the moment they appear. It splits at segment boundaries instead, and the
+# last line is padded to the window width so it sits flush right, above Claude
+# Code's own "auto mode on" footer rather than as a left-aligned block stacked
+# on it.
+#
+# COLUMNS is how the width gets in: Claude Code spawns the command from a
+# terminal and the variable is there (measured 155). tput is the second source.
+# The cases below pin it through PET_INFO_WIDTH so a tput that answers in a
+# non-terminal (it does, on Git Bash) cannot decide what they assert.
+FIT_CONFIG='{"display":true,"currency":{"code":"USD","usd_rate":1},"pricing":{"models":{
+  "m":{"input_per_mtok":1,"output_per_mtok":2,"cache_read_per_mtok":0.1}}}}'
+FIT_PAYLOAD="$(jq -cn '{
+  model:{display_name:"Sonnet",id:"m"}, session_id:"fit",
+  workspace:{current_dir:"/tmp/project"},
+  effort:{level:"high"},
+  context_window:{used_percentage:21,context_window_size:200000,
+    current_usage:{input_tokens:10,cache_creation_input_tokens:0,
+                   cache_read_input_tokens:31000,output_tokens:1200}},
+  cost:{total_cost_usd:0.01,total_duration_ms:192000,
+        total_lines_added:12,total_lines_removed:3}}')"
+
+# A home of its own, and no state.json in it: the assertion is about the metrics
+# bar's line count, so a creature drawn above it would make every case read one
+# line too many. PET_DIR follows HOME here, which is what the script resolves.
+FIT_HOME="$TMP/home-fit"
+mkdir -p "$FIT_HOME/.claude/claude-pet"
+
+fit_render() { # $1 = width, $2 = config json → the bar, escapes stripped
+  printf '%s' "$2" > "$FIT_HOME/.claude/claude-pet/config.json"
+  printf '%s' "$FIT_PAYLOAD" | HOME="$FIT_HOME" PET_INFO_WIDTH="$1" \
+    PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+    bash "$SL" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
+}
+fit_width() { # longest line of $1, in characters
+  awk '{ if (length > m) m = length } END { print m + 0 }' <<< "$1"
+}
+# Count non-empty lines. `wc -l <<< "$s"` would add one for the newline the
+# here-string appends, so a single-line bar measured as two.
+fit_lines() { awk 'NF { n++ } END { print n + 0 }' <<< "$1"; }
+
+# A wide terminal must not be touched: no newline, and the tail still present.
+fit_wide="$(fit_render 200 "$FIT_CONFIG")"
+check "a bar that fits is left on one line" "$(fit_lines "$fit_wide")" "1"
+check "and nothing is dropped from it"      "$fit_wide" "+12/-3"
+
+# Narrow: it splits, and no line exceeds the window.
+fit_narrow="$(fit_render 80 "$FIT_CONFIG")"
+check "a narrow window splits the bar"      "$(fit_lines "$fit_narrow")" "2"
+check "no line is wider than the window"    "$(fit_width "$fit_narrow")" "80"
+check "the cost survives the split"         "$fit_narrow" '$0.0100'
+check "and so do the line counts"           "$fit_narrow" "+12/-3"
+check "the split happens between segments"  "$fit_narrow" "cache 99%"
+
+# The last line is padded to the full width, which is what makes it right-
+# aligned. It has to be measured with the escapes still in it, because that
+# padding lives inside them.
+fit_pad="$(printf '%s' "$FIT_PAYLOAD" | HOME="$FIT_HOME" PET_INFO_WIDTH=80 \
+  PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" 2>/dev/null | tail -1)"
+case "$fit_pad" in
+  *$'\033[0m') pad_closed=yes ;;
+  *)           pad_closed=no ;;
+esac
+check "the padded line ends in a reset, so trim() keeps the padding" "$pad_closed" "yes"
+
+# Much narrower than any segment: still one segment per line, never clipped.
+fit_tiny="$(fit_render 30 "$FIT_CONFIG")"
+check "a very narrow window still shows every segment" \
+  "$(grep -cF '+12/-3' <<< "$fit_tiny")" "1"
+check "and no line overflows the window" \
+  "$(awk '{ if (length > m) m = length } END { print (m <= 30) }' <<< "$fit_tiny")" "1"
+
+# info.wrap:false restores the single line, however long — Claude Code then
+# truncates it, which is the old behaviour.
+check "info.wrap=false keeps the bar on one line" \
+  "$(fit_lines "$(fit_render 80 '{"display":true,"info":{"wrap":false}}')")" "1"
+
+# No width available: nothing is attempted. Guessing would either wrap a bar
+# that fits or clip one that does not. PET_INFO_WIDTH=0 is the way to say so out
+# loud — unsetting COLUMNS is not enough, because tput answers even when the
+# command was not started from a terminal.
+fit_nowidth="$(printf '%s' "$FIT_PAYLOAD" | HOME="$FIT_HOME" PET_INFO_WIDTH=0 \
+  PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+check "without a width the bar is untouched" "$(fit_lines "$fit_nowidth")" "1"
+check "and its tail is still there"          "$fit_nowidth" "+12/-3"
+
+# The width has to count display cells, not bytes: ⚡ and CJK are two cells,
+# while ⬡ │ are one — and treating every non-ASCII character as wide would push
+# the padding short and leave the last line ragged.
+cell_width() { # source the width helper out of the script and use it
+  bash -c '
+    source <(sed -n "/^ESC_SEQ=/,/^}/p" "$1")
+    vis_width "$2"
+  ' _ "$SL" "$1"
+}
+check "a wide glyph counts as two cells"   "$(cell_width '峰')" "2"
+check "the bolt counts as two cells"       "$(cell_width '⚡')" "2"
+check "the model mark counts as one"       "$(cell_width '⬡')" "1"
+check "the divider counts as one"          "$(cell_width '│')" "1"
+check "escapes take no cells"              "$(cell_width $'\033[38;5;245mab\033[0m')" "2"
+
 # ── concurrent renders share the state file ──────────────────────────────────
 # The status line refreshes every 30s while hooks fire for the same session, and
 # a second Claude Code session renders against the same cost-state.json. Two
@@ -482,7 +697,7 @@ check "and both share one updated_at"    "$(jq -r 'if .updated_at then "set" els
 # The Windows lock branch. msvcrt is Windows-only, so its use is checked with a
 # stub that records what it was asked to do: a byte-range lock needs the file to
 # hold at least one byte, and the lock has to be released on the way out.
-python3 - "$SL" <<'PY'
+py - "$SL" <<'PY'
 import os, re, sys
 from pathlib import Path
 src = Path(sys.argv[1]).read_text(encoding="utf-8")
@@ -535,7 +750,9 @@ peak_render() { # $1=now (UTC) $2=cache-read tokens; 30M ≈ ¥1.22 at peak rate
     printf '"context_window_size":200000,"current_usage":{"input_tokens":1000,'
     printf '"cache_creation_input_tokens":0,"cache_read_input_tokens":%s,"output_tokens":2000}},' "$2"
     printf '"cost":{"total_cost_usd":49.33}}'
-  } | HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_NOW_UTC="$1" \
+  # PET_INFO_WIDTH=0: these cases assert on one line, and a tput-derived width
+  # would split the bar before `tail -1` looked at it.
+  } | HOME="$TMP" PET_INFO_WIDTH=0 PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_NOW_UTC="$1" \
       bash "$SL" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1
 }
 count_in() { grep -c "$1" <<< "$2"; }
@@ -586,7 +803,7 @@ INFO_PAYLOAD='{"model":{"display_name":"deepseek-flash","id":"deepseek-flash"},"
 info_render() { # $1 = config JSON
   printf '%s' "$1" > "$PET_DIR/config.json"
   rm -f "$PET_DIR/cost-state.json"
-  HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_NOW_UTC=2026-10-12T05:00:00Z \
+  HOME="$TMP" PET_INFO_WIDTH=0 PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_NOW_UTC=2026-10-12T05:00:00Z \
     bash "$SL" <<< "$INFO_PAYLOAD" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
 }
 
@@ -680,24 +897,31 @@ check   "a stub does not hide the real python behind it" \
 nocheck "and the cost is the estimate, not the fallback" "$stub_out" '$0.0100'
 
 # With no working interpreter reachable, the block must be skipped: nothing
-# written, nothing on stderr, and the payload's own number in the bar. PATH has
-# to be only the stubs — pointing it at /usr/bin keeps a real python reachable
-# and would test nothing. The few utilities the script needs first are copied in.
+# written, nothing on stderr, and the payload's own number in the bar.
+#
+# The interpreter is hidden by removing every directory that holds one from
+# PATH, not by replacing PATH with a bare stub directory. Git Bash's utilities
+# are native binaries that load their runtime DLLs by name from their own
+# directory, so a PATH made only of copied binaries fails to start bash at all
+# ("error while loading shared libraries", exit 127) — which the test would
+# report as "printed nothing" while proving nothing. Filtering keeps the real
+# runtime reachable and only takes the interpreters away.
 NOSH="$TMP/no-python"
 mkdir -p "$NOSH"
 for n in python3 python; do
   printf '#!/bin/sh\necho "Python was not found"\nexit 0\n' > "$NOSH/$n"
   chmod +x "$NOSH/$n"
 done
-# bash itself must be reachable (the script is invoked as `bash "$SL"`), along
-# with the utilities it forks. `command -v` may answer with a bare name for a
-# shell builtin, so only absolute paths are copied.
-for u in bash jq awk sed grep cat mktemp tr head wc cut which printenv; do
-  p=$(command -v "$u" 2>/dev/null) || continue
-  [[ "$p" == /* && -f "$p" ]] && cp "$p" "$NOSH/" 2>/dev/null
-done
+NOSH_PATH="$NOSH"
+while IFS= read -r d; do
+  [[ -n "$d" ]] || continue
+  if [[ -x "$d/python3" || -x "$d/python" || -x "$d/python.exe" || -x "$d/python3.exe" ]]; then
+    continue                       # a real interpreter lives here: drop the dir
+  fi
+  NOSH_PATH="$NOSH_PATH:$d"
+done < <(printf '%s' "$PATH" | tr ':' '\n')
 rm -f "$PET_DIR/cost-state.json"
-nopy_out="$(HOME="$TMP" PATH="$NOSH" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 \
+nopy_out="$(HOME="$TMP" PATH="$NOSH_PATH" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 \
   PET_PRICING_COST=1 bash "$SL" <<< "$WIN_PAYLOAD" 2>"$TMP/nopy.err" | sed 's/\x1b\[[0-9;]*m//g')"
 check "without a real python nothing is written" \
   "$([[ -f "$PET_DIR/cost-state.json" ]] && echo written || echo missing)" "missing"
@@ -715,6 +939,15 @@ pnorm_fn() {
   bash -c '
     source <(sed -n "/^pnorm() {/,/^}/p" "'"$SL"'")
     pnorm "$1"
+  ' _ "$1"
+}
+# The Windows spelling of a path, as the status line would see it coming back
+# from a native binary. Only meaningful under MSYS (where cygpath exists).
+pnorm_msys_fn() {
+  bash -c '
+    source <(sed -n "/^pnorm() {/,/^}/p" "'"$SL"'")
+    source <(sed -n "/^pnorm_msys() {/,/^}/p" "'"$SL"'")
+    pnorm_msys "$1"
   ' _ "$1"
 }
 check "backslash path is folded to forward slashes" \
@@ -750,8 +983,17 @@ check "a repo-relative dir is shown, not the absolute path" \
   "$repo_out" "winrepo/sub"
 # The ~ prefix must fold too: HOME and the path both reach fmt_dir in whatever
 # spelling the platform gave them.
-home_out="$(HOME="$TMP" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
-  bash "$SL" <<< "$(jq -cn --arg dir "$TMP/plain/dir" '{
+#
+# HOME is passed in the Windows spelling here. On Git Bash `mktemp -d` answers
+# /tmp/..., which only MSYS understands; a native binary (jq) expands it to
+# C:/Users/…/Temp/… before it reaches the payload, so HOME and the directory
+# arrived in two different spellings and no prefix could match. That is a
+# property of the harness, not of the folding rule — the Windows-vs-MSYS case
+# already has its own test above ("backslash cwd under a drive-letter HOME").
+home_spelling="$(cygpath -m "$TMP" 2>/dev/null)"
+[[ -n "$home_spelling" ]] || home_spelling="$TMP"
+home_out="$(HOME="$home_spelling" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 PET_PRICING_COST=0 \
+  bash "$SL" <<< "$(jq -cn --arg dir "$home_spelling/plain/dir" '{
     model:{display_name:"m",id:"m"}, session_id:"h",
     workspace:{current_dir:$dir},
     context_window:{used_percentage:5,context_window_size:200000,
@@ -797,7 +1039,7 @@ check "a deep POSIX path still elides to a leading slash" \
 # was never found. Exercised through the rate, which is the only reader.
 #
 # Direct check of the rule, independent of any file lookup.
-python3 -c '
+py -c '
 import re, sys
 cases = [
     ("E:\\local-ai\\claude\\proj", "E--local-ai-claude-proj"),

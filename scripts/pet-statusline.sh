@@ -56,7 +56,12 @@ parse_status() {
         n($in.cost.total_cost_usd),
         i($in.cost.total_duration_ms),
         i($in.cost.total_lines_added),
-        i($in.cost.total_lines_removed)
+        i($in.cost.total_lines_removed),
+        # Effort for the current turn, already resolved by Claude Code — a
+        # "max" the model cannot take arrives here as "high". The whole key is
+        # absent when the model does not support effort, so // "" turns that
+        # into "draw no segment" rather than an empty box in the line.
+        ($in.effort.level // "")
       ]
     | map(tostring) | join("\u001f")
   '
@@ -69,7 +74,12 @@ PARSE=$(parse_status <<< "$input")
 IFS=$'\x1f' read -r \
   MODEL MODEL_ID SESSION_ID DIR PCT CTX_SIZE CTX_USED CACHE_READ OUT_TOK \
   USAGE_IN USAGE_CC USAGE_CR USAGE_OUT COST DUR_MS LINES_ADD LINES_DEL \
+  EFFORT_PAYLOAD \
   <<< "$PARSE"
+# The payload's value stands on its own: it needs no python, no config file and
+# no transcript, so the segment keeps working when all three are missing. The
+# block below only adds the transcript fallback for when the key is absent.
+EFFORT="${EFFORT_PAYLOAD:-}"
 
 # Optional local $/MTok estimate (auto-updated); may undercount — see README
 COST_STATE="$PET_DIR/cost-state.json"
@@ -111,7 +121,7 @@ if { [[ "${PET_PRICING_COST:-1}" != "0" ]] || [[ "${PET_OUTPUT_RATE:-1}" != "0" 
     PET_COST_STATE="$COST_STATE" "$PET_PY" - "$PET_CONFIG" \
       "${MODEL_ID:-}" "${MODEL:-}" "${SESSION_ID:-}" \
       "${USAGE_IN:-0}" "${USAGE_CC:-0}" "${USAGE_CR:-0}" "${USAGE_OUT:-0}" \
-      "${COST:-0}" "${DIR:-}" <<'PY'
+      "${COST:-0}" "${DIR:-}" "${EFFORT_PAYLOAD:-}" <<'PY'
 import json, os, re, sys
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta, timezone
@@ -127,7 +137,7 @@ except ImportError:
     msvcrt = None
 import time as _time                                 # `time` below is datetime.time
 
-cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback, cwd = sys.argv[1:11]
+cfg_path, model_id, model_name, session_id, u_in, u_cc, u_cr, u_out, fallback, cwd, effort_payload = sys.argv[1:12]
 state_path = Path(os.environ.get("PET_COST_STATE") or Path.home() / ".claude/claude-pet/cost-state.json")
 
 # Fallback schedule if the config carries no schedule (peak windows are UTC)
@@ -325,6 +335,11 @@ def transcript_for(session_id: str, cwd: str):
 def scan_transcript(path, entry: dict):
     """(paired output tokens, paired API milliseconds) for this transcript.
 
+    Also records the last effort level seen on an assistant record into
+    entry["last_effort"] — the fallback for when the payload carries no
+    effort.level. It comes for free here: these records are already parsed line
+    by line for their usage, and the field is on the same object.
+
     Only new lines are read, and only whole ones — see the fragment note below.
     Deduplicated by message id, the same key the cost audit uses: one response
     can be recorded more than once, and counting those again would inflate the
@@ -354,6 +369,9 @@ def scan_transcript(path, entry: dict):
     # unmatched ids are carried in the state until the response shows up.
     pending = entry.get("pending_requests")
     pending = dict(pending) if isinstance(pending, dict) else {}
+    # Survives the rescan below on purpose: it describes the newest response in
+    # the file, which a rescan re-reads rather than invalidates.
+    last_effort = entry.get("last_effort") or ""
     # Start over unless this entry was written by this version, and whenever the
     # file shrank (truncated, rewritten, or compacted away under us). The dedupe
     # set and the pending map have to be cleared with the offset, or the rescan
@@ -386,6 +404,13 @@ def scan_transcript(path, entry: dict):
                     if rid and rts:
                         pending[rid] = rts
                     continue
+                # Before the usage check, and before the dedupe: effort belongs
+                # to the assistant record itself, and a record that carries no
+                # usage still states one. Records are appended in order, so the
+                # last one read is the newest.
+                lvl = rec.get("effort")
+                if isinstance(lvl, str) and lvl:
+                    last_effort = lvl
                 msg = rec.get("message")
                 usage = msg.get("usage") if isinstance(msg, dict) else None
                 if not isinstance(usage, dict):
@@ -416,10 +441,22 @@ def scan_transcript(path, entry: dict):
     entry["rate_v"] = RATE_STATE_V
     # Bounded: only responses recent enough to still be in flight need this.
     entry["counted_ids"] = list(seen)[-200:]
+    if last_effort:
+        entry["last_effort"] = last_effort
     return tokens, api_ms
 
 
 rate_str = ""
+
+# The effort level to draw. The payload's effort.level is the value Claude Code
+# resolved for the current turn — including any silent downgrade, e.g. "max" on
+# a model that cannot take it arrives as "high" — so it is preferred whenever it
+# is there. The key is simply absent on a model without effort support, which is
+# where the transcript fallback in scan_transcript() comes in: it lags one
+# response behind (a change only shows once that response lands) and needs the
+# scan, which is gated on PET_OUTPUT_RATE. When neither source has a value the
+# segment is dropped rather than drawn empty.
+effort_str = effort_payload
 
 # One transaction for the whole render. The two accumulators — the output rate
 # and the priced cost — write the same session entry, and they used to take the
@@ -504,6 +541,11 @@ if os.environ.get("PET_OUTPUT_RATE", "1") != "0":
     if isinstance(rate, (int, float)) and rate > 0:
         rate_str = f"{rate:.1f}"
 
+    if not effort_str:
+        fallback_effort = _entry.get("last_effort")
+        if isinstance(fallback_effort, str):
+            effort_str = fallback_effort
+
     # Write only when the scan consumed something: this renders every 30s, and a
     # no-op write on each would be pure churn. Keyed on the offset advancing,
     # not on having paired a response — a transcript whose responses cannot be
@@ -525,7 +567,7 @@ def emit(cost, tier="", ctx="", secs="", direction="", premium=""):
     """
     end_state()
     print("|".join([str(cost), str(tier), str(ctx), str(secs),
-                    str(direction), str(premium), rate_str]))
+                    str(direction), str(premium), rate_str, effort_str]))
 
 
 try:
@@ -741,9 +783,9 @@ emit(f"{total:.8f}" if total > 0 else fallback,
 PY
   )
   if [[ -n "$COST_CUSTOM" ]]; then
-    # <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>|<tok/s>
+    # <usd>|<peak|off_peak|>|<context tokens>|<secs to switch>|<direction>|<premium usd>|<tok/s>|<effort>
     # a bare number means none of it was available
-    IFS='|' read -r COST COST_TIER COST_WINDOW COST_SECS COST_DIR COST_PREMIUM RATE_TOK_S \
+    IFS='|' read -r COST COST_TIER COST_WINDOW COST_SECS COST_DIR COST_PREMIUM RATE_TOK_S EFFORT \
       <<< "$COST_CUSTOM"
   fi
 fi
@@ -889,11 +931,11 @@ DIR_DISPLAY=$(fmt_dir "$GIT_DIR" "$REPO_ROOT")
 # consistent snapshot. The display toggle comes from the same read.
 CFG_DISPLAY="true"; CFG_CODE=""; CFG_RATE=""; CFG_SHOW_USD=""; CFG_SYMBOL=""; CFG_SHOW_TIER=""
 CFG_CTX_WINDOW=""; CFG_PK_ENABLED=""; CFG_PK_COUNTDOWN=""; CFG_PK_PREWARN=""; CFG_PK_THRESHOLD=""; CFG_PK_PREMIUM=""
-CFG_INFO_SHOW=""; CFG_INFO_HIDE=""
+CFG_INFO_SHOW=""; CFG_INFO_HIDE=""; CFG_INFO_WRAP=""
 if [[ -f "$PET_CONFIG" ]]; then
   IFS=$'\x1f' read -r CFG_DISPLAY CFG_CODE CFG_RATE CFG_SHOW_USD CFG_SYMBOL CFG_SHOW_TIER CFG_CTX_WINDOW \
     CFG_PK_ENABLED CFG_PK_COUNTDOWN CFG_PK_PREWARN CFG_PK_THRESHOLD CFG_PK_PREMIUM \
-    CFG_INFO_SHOW CFG_INFO_HIDE \
+    CFG_INFO_SHOW CFG_INFO_HIDE CFG_INFO_WRAP \
     <<< "$(jq -r '[
       (if .display == false then "false" else "true" end),
       (.currency.code // ""),
@@ -908,7 +950,8 @@ if [[ -f "$PET_CONFIG" ]]; then
       (.peak_alert.cost_threshold // ""),
       (if .peak_alert.show_premium == false then "0" else "1" end),
       (if .info.show == false then "0" else "1" end),
-      ((.info.hide // []) | map(select(type == "string")) | join(","))
+      ((.info.hide // []) | map(select(type == "string")) | join(",")),
+      (if .info.wrap == false then "0" else "1" end)
     ] | map(tostring) | join("\u001f")' "$PET_CONFIG" 2>/dev/null)"
 fi
 PET_DISPLAY="${CFG_DISPLAY:-true}"
@@ -923,6 +966,7 @@ SHOW_TIER="${PET_COST_TIER_LABEL:-${CFG_SHOW_TIER:-1}}"
 # running total instead of a fresh zero.
 INFO_SHOW="${PET_INFO_SHOW:-${CFG_INFO_SHOW:-1}}"
 INFO_HIDE=",${PET_INFO_HIDE:-${CFG_INFO_HIDE:-}},"
+INFO_WRAP="${PET_INFO_WRAP:-${CFG_INFO_WRAP:-1}}"
 
 seg_on() { # $1 = segment name
   [[ "$INFO_SHOW" != "0" ]] || return 1
@@ -1069,10 +1113,15 @@ fi
 
 # ── Assemble status bar ──────────────────────────────────────────────────────
 # Example:
-#   ⬡ model │ claudePet │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
+#   ⬡ model │ high │ claudePet │ [###-------] 21% 42.1k/200k │ cache 99% · 207k │ out 1.2k │ ¥0.01 │ 3m12s │ +12/-3
 # Each segment is gated by seg_on, so info.hide can drop any of them but model.
+# effort sits next to the model because it qualifies it — the same model at
+# "low" and at "max" is a different trade of tokens for quality — and because it
+# disappears entirely on a model without effort support, which reads better
+# there than as a gap further down the line.
 L="$PK_PREFIX"
 seg_on model    && L="${L}${GRAY}⬡ ${MODEL}${RST}"
+seg_on effort   && [[ -n "${EFFORT:-}" ]] && L="${L}${SEP}${GRAY}${EFFORT}${RST}"
 seg_on dir      && L="${L}${SEP}${GRAY}${DIR_DISPLAY}${RST}"
 seg_on branch   && [[ -n "$BRANCH" ]] && L="${L}${SEP}${GRAY}⎇ ${BRANCH}${RST}"
 seg_on context  && L="${L}${SEP}${BAR_CLR}${BAR}${RST}${GRAY} ${PCT}% ${CTX_NUM}${RST}"
@@ -1086,6 +1135,141 @@ seg_on duration && [[ "${DUR_MS:-0}" != "0" ]] && L="${L}${SEP}${GRAY}${DUR_FMT}
 if seg_on lines && { [[ "${LINES_ADD:-0}" != "0" ]] || [[ "${LINES_DEL:-0}" != "0" ]]; }; then
   L="${L}${SEP}${GRAY}${LINES_FMT}${RST}"
 fi
+
+# ── Fit the bar to the terminal ──────────────────────────────────────────────
+# A narrow window used to cut the tail of the bar off, since Claude Code renders
+# a single line with wrap:"truncate" — the cost and the line counts are what
+# disappeared, at the times they matter most.
+#
+# The bar is assembled as segments separated by SEP, and the first one starts
+# with a colour escape. Splitting on that exact separator is safe: no segment
+# contains it, and the escape sequences they do contain never spell " │ ".
+#
+# Two modes, chosen with info.wrap (default on):
+#   on    the bar splits at segment boundaries into as many lines as it needs.
+#         The last line — the one directly above Claude Code's own mode footer
+#         ("auto mode on") — is padded to the full width and so sits flush
+#         right, which keeps the overflow from reading as a left-aligned block
+#         stacked on top of that footer. Nothing is dropped: a segment only ever
+#         moves to another line, and the split happens between segments, so no
+#         value is cut in half.
+#   off   one line, however long. Claude Code renders it with wrap:"truncate",
+#         so the tail is cut — for anyone who prefers the old behaviour.
+#
+# The padding is emitted inside the colour escapes on purpose: Claude Code runs
+# every output line through .trim(), which would eat a trailing run of spaces.
+# Ending the run with RST leaves .trim() nothing to take.
+#
+# The width comes from COLUMNS. Claude Code spawns the command from a terminal,
+# so it is there in practice (measured 155); tput is the second source for a
+# caller that did not inherit it. PET_INFO_WIDTH overrides both — set it to pin
+# a width by hand, or to 0 to switch fitting off for a caller where tput would
+# otherwise answer. With no width from anywhere, no fitting is attempted at all:
+# guessing would either wrap something that fits or clip something that does not.
+FIT_WIDTH="${PET_INFO_WIDTH:-${COLUMNS:-}}"
+[[ "$FIT_WIDTH" =~ ^[0-9]+$ ]] || FIT_WIDTH="$(tput cols 2>/dev/null)"
+if [[ "$FIT_WIDTH" =~ ^[0-9]+$ ]] && (( FIT_WIDTH > 0 )); then :; else FIT_WIDTH=""; fi
+
+# Visible width of a string: escapes have no width, and the CJK characters this
+# line can contain (峰 谷 ⚡, plus anything a model name carries) are two cells.
+# Scanned by code point, not by cell, so a multi-byte character counts once.
+ESC_SEQ=$'\033'
+# A CSI sequence (colour, reset) as a regex, stripped one at a time in a loop.
+# The parameter-expansion form `${s//$'\033'\[[0-9;]*m/}` looks equivalent but
+# is not: `*` there runs past the closing `m` and swallows the text after it,
+# so a whole line measured as zero width.
+ANSI_RE="${ESC_SEQ}\[[0-9;]*m"
+vis_width() {
+  local s="$1" w=0 i c
+  while [[ "$s" =~ $ANSI_RE ]]; do
+    s="${s/"${BASH_REMATCH[0]}"/}"
+  done
+  # ${#s} is a count of characters, and ${s:i:1} yields one character at a
+  # time, so each character is classified exactly once — no byte arithmetic.
+  # Widths follow the East Asian Width property, because guessing "any non-ASCII
+  # is wide" overstates the box-drawing glyphs this bar is built from: ⬡ is
+  # narrow (N) and │ ◆ are ambiguous (A), which terminals draw in one cell,
+  # while ⚡ and the CJK in a model name are wide (W) and take two.
+  local cp
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    if [[ "$c" == [\ -~] ]]; then
+      (( w += 1 )); continue
+    fi
+    cp=$(printf '%d' "'$c" 2>/dev/null) || cp=0
+    # Wide ranges, per Unicode East Asian Width: CJK, Hangul, kana and the
+    # fullwidth forms. U+26A1 (⚡) is East Asian Wide but sits below the emoji
+    # block, so it needs its own clause — treating it as narrow pulled the
+    # padding one cell short whenever the peak-tariff marker was on the line.
+    if (( cp == 0x26A1 \
+       || (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) \
+       || (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) \
+       || (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) \
+       || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) \
+       || (cp >= 0x20000 && cp <= 0x3FFFD) )); then
+      (( w += 2 ))
+    else
+      (( w += 1 ))
+    fi
+  done
+  printf '%d' "$w"
+}
+
+# A segment list → lines at most $2 wide, splitting only at segment boundaries.
+# Greedy: a segment joins the current line while it still fits, so the number of
+# lines is minimal. Every line is emitted with its colour escapes intact and
+# closed with RST, because Claude Code renders each line independently and a
+# colour left open at the end of a line would bleed into the next.
+#
+# The last line is padded to the full width and then closed with RST again: the
+# padding has to end in an escape for .trim() to keep it, which is what puts the
+# final line flush against the right edge, on the row just above Claude Code's
+# own mode footer. Nothing is lost either way — wrapping only ever moves
+# segments to another line, it never drops or abbreviates one.
+wrap_segments() { # $1 = the bar, $2 = max width → prints lines
+  local rest="$1" max="$2"
+  local line="" lw=0 seg sw sepw=0 pad gap
+  local -a lines=()
+
+  sepw=$(vis_width "$SEP")
+  # Cut at the first separator each time. Quoting SEP inside the pattern makes
+  # both expansions literal, so its escape characters are matched as-is.
+  while [[ "$rest" == *"$SEP"* ]]; do
+    seg="${rest%%"$SEP"*}"
+    rest="${rest#*"$SEP"}"
+    sw=$(vis_width "$seg")
+    if [[ -n "$line" ]] && (( lw + sepw + sw > max )); then
+      lines+=("$line")
+      line="$seg"; lw=$sw
+    else
+      if [[ -n "$line" ]]; then line="${line}${SEP}${seg}"; (( lw += sepw + sw ))
+      else line="$seg"; lw=$sw; fi
+    fi
+  done
+  # The final segment and the trailing run of the bar (no separator after it).
+  seg="$rest"
+  if [[ -n "$seg" ]]; then
+    sw=$(vis_width "$seg")
+    if [[ -n "$line" ]] && (( lw + sepw + sw > max )); then
+      lines+=("$line"); line="$seg"; lw=$sw
+    else
+      if [[ -n "$line" ]]; then line="${line}${SEP}${seg}"; (( lw += sepw + sw ))
+      else line="$seg"; lw=$sw; fi
+    fi
+  fi
+  [[ -n "$line" ]] && lines+=("$line")
+
+  # Right-align the last line. A line that is already at the limit is left
+  # alone, and a terminal too narrow to hold even that line gets no padding
+  # attempt — the padding is only ever additive, never a reason to clip.
+  local last=$(( ${#lines[@]} - 1 ))
+  if (( last >= 0 )); then
+    gap=$(( max - $(vis_width "${lines[$last]}") ))
+    (( gap > 0 )) && { printf -v pad '%*s' "$gap" ''; lines[$last]="${lines[$last]}${pad}${RST}"; }
+  fi
+
+  printf '%s\n' "${lines[@]}"
+}
 
 # ── Pet Buddy (monstapix block art) ──────────────────────────────────────────
 # PET_DISPLAY came from the config read above
@@ -1123,10 +1307,14 @@ if [[ "$PET_DISPLAY" = "true" ]] && [[ -f "$PET_STATE" ]] && [[ -f "$PET_SPRITES
     (( AGE < 600 )) && PET_MSG="$ACT_MSG"
   fi
 
-  # Read sprite lines and print with message on first, info on last
+  # Read sprite lines and print with message on first, info on last.
+  # The trailing \r is stripped because jq on Windows is a native binary and
+  # writes CRLF: left in, it lands at the end of every sprite row, and a bare CR
+  # in the middle of the bar is a cursor reset — the pet's last row ends up
+  # overwriting the line the metrics are drawn on.
   SPRITE_LINES=()
   while IFS= read -r line || [[ -n "$line" ]]; do
-    SPRITE_LINES+=("$line")
+    SPRITE_LINES+=("${line%$'\r'}")
   done < <(jq -r --arg line "${PET_LINE_ID:-titan}" --arg idx "${PET_STAGE_IDX:-0}" \
     '((.[$line] // .[keys[0]])[$idx] // [])[]' "$PET_SPRITES" 2>/dev/null)
 
@@ -1157,5 +1345,16 @@ fi
 # off leaves an empty status line row (observed): Claude Code reserves that
 # region, so it is not something this script can take back.
 if [[ -n "$L" ]]; then
-  printf "%s\n" "$L"
+  BAR_LINES=()
+  if [[ -n "$FIT_WIDTH" && "${INFO_WRAP:-1}" != "0" ]] \
+     && (( $(vis_width "$L") > FIT_WIDTH )); then
+    while IFS= read -r _wl; do
+      [[ -n "$_wl" ]] && BAR_LINES+=("$_wl")
+    done < <(wrap_segments "$L" "$FIT_WIDTH")
+  fi
+  if (( ${#BAR_LINES[@]} > 0 )); then
+    printf "%s\n" "${BAR_LINES[@]}"
+  else
+    printf "%s\n" "$L"
+  fi
 fi

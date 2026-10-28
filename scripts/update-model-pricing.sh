@@ -174,14 +174,24 @@ pet_fetch "$WORK/docs.html" "${PET_PRICING_DOCS_FILE:-}" \
   'https://api-docs.deepseek.com/quick_start/pricing/' \
   && DOCS="$WORK/docs.html" || true
 
-pet_fetch "$WORK/holiday-$CUR_YEAR.json" "${PET_PRICING_HOLIDAY_FILE:-}" \
-  "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/$CUR_YEAR.json" \
-  && HOLIDAY_CUR="$WORK/holiday-$CUR_YEAR.json" || true
+# holiday-cn, trying every jsDelivr host: which ones answer varies by network —
+# cdn.jsdelivr.net was reset from one Windows machine while fastly, gcore and
+# testingcf all returned 200 with identical content. Retrying the same URL
+# would not help; asking a different host does. Echoes the file it landed in, or
+# nothing when every host failed — the caller treats that as "unavailable".
+fetch_holiday() { # $1=override file (empty → fetch) $2=year
+  local override="$1" year="$2" out="$WORK/holiday-$2.json" mirror
+  local path="gh/NateScarlet/holiday-cn@master/$year.json"
+  pet_fetch "$out" "$override" "https://cdn.jsdelivr.net/$path" && { printf '%s' "$out"; return 0; }
+  for mirror in fastly gcore testingcf; do
+    pet_fetch "$out" "" "https://$mirror.jsdelivr.net/$path" && { printf '%s' "$out"; return 0; }
+  done
+  return 1
+}
 
+HOLIDAY_CUR="$(fetch_holiday "${PET_PRICING_HOLIDAY_FILE:-}" "$CUR_YEAR")" || true
 # Next year is only published late in the current one; a 404 here is normal
-pet_fetch "$WORK/holiday-$NEXT_YEAR.json" "" \
-  "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/$NEXT_YEAR.json" \
-  && HOLIDAY_NEXT="$WORK/holiday-$NEXT_YEAR.json" || true
+HOLIDAY_NEXT="$(fetch_holiday "" "$NEXT_YEAR")" || true
 
 acquire_lock
 

@@ -92,7 +92,7 @@ set_display() { # $1 = true|false
 # info.show is the master switch; info.hide drops single segments while it is on.
 # `model` is not hideable — it is the line's identity, so the bar cannot end up
 # blank by accident (to hide everything, use info off).
-SEGMENTS="model dir branch context cache out rate cost duration lines"
+SEGMENTS="model effort dir branch context cache out rate cost duration lines"
 
 set_info_show() { # $1 = true|false
   local value="$1" out
@@ -233,8 +233,17 @@ reset_pet() {
   families="$(jq -r '.evolutionLines | keys[]' "$CREATURES" 2>/dev/null)"
   [[ -n "$families" ]] || die "no evolution lines in $CREATURES"
 
+  # Split on a bare \n, then strip a trailing \r from each name. jq on Windows
+  # is a native binary, so `jq -r` writes CRLF; `$(...)` only eats the final
+  # newline, which leaves \r inside every name but the last. That \r went into
+  # state.json as part of currentLineId ("titan\r"), where nothing could match
+  # it against the registry again — and since the array was indexed by RANDOM,
+  # reset worked or broke depending on which family it drew.
   local lines=()
-  while IFS= read -r l; do [[ -n "$l" ]] && lines+=("$l"); done <<< "$families"
+  while IFS= read -r l; do
+    l="${l%$'\r'}"
+    [[ -n "$l" ]] && lines+=("$l")
+  done <<< "$families"
   line="${lines[$((RANDOM % ${#lines[@]}))]}"
   stage="$(jq -r --arg l "$line" '.evolutionLines[$l].stages[0].name // "???"' "$CREATURES" 2>/dev/null)"
 

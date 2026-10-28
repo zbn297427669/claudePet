@@ -95,6 +95,31 @@ check "reset drops the activity line"     "$([ -f "$d/last-activity.json" ] && e
 line="$(q "$d/state.json" '.currentLineId')"
 check "the family comes from the registry" "$(jq -r --arg l "$line" '.evolutionLines | has($l)' "$d/creatures.json")" "true"
 
+# jq is a native binary on Windows and `jq -r` writes CRLF. The family list is
+# read with a while/read loop, and `$(...)` strips only the final newline — so
+# every name but the last arrived with a trailing \r attached. Written into
+# state.json as part of currentLineId that made the file *invalid JSON* (a bare
+# control character inside a string), and because the array is indexed by
+# RANDOM the damage appeared only sometimes: a drawn family other than the last
+# broke, the last one survived. The status line then silently dropped the whole
+# creature, since jq could not read state.json at all.
+#
+# Reset many times so a single lucky draw cannot pass this, and compare every
+# result against the registry rather than only the last one.
+bad_lines=0
+for _ in 1 2 3 4 5 6 7 8; do
+  run_toggle "$d" reset >/dev/null
+  l="$(q "$d/state.json" '.currentLineId')"
+  [[ "$(jq -r --arg l "$l" '.evolutionLines | has($l)' "$d/creatures.json")" == "true" ]] \
+    || bad_lines=$((bad_lines + 1))
+done
+check "every reset picks a registry family, with no CR glued on" "$bad_lines" "0"
+# A \r inside a JSON string is an unescaped control character, so an invalid
+# document is the sharpest evidence the CR reached the file at all — and it is
+# what the status line actually tripped over.
+check "the state file reset writes is valid JSON" \
+  "$(jq -e . "$d/state.json" >/dev/null 2>&1 && echo valid || echo invalid)" "valid"
+
 # ── info: the metrics bar ───────────────────────────────────────────────────
 d="$(newdir)"
 run_toggle "$d" info off >/dev/null

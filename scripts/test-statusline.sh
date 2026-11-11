@@ -915,27 +915,36 @@ nocheck "and the cost is the estimate, not the fallback" "$stub_out" '$0.0100'
 # With no working interpreter reachable, the block must be skipped: nothing
 # written, nothing on stderr, and the payload's own number in the bar.
 #
-# The interpreter is hidden by removing every directory that holds one from
-# PATH, not by replacing PATH with a bare stub directory. Git Bash's utilities
-# are native binaries that load their runtime DLLs by name from their own
-# directory, so a PATH made only of copied binaries fails to start bash at all
-# ("error while loading shared libraries", exit 127) — which the test would
-# report as "printed nothing" while proving nothing. Filtering keeps the real
-# runtime reachable and only takes the interpreters away.
+# Hiding python must not take anything else with it. The first attempt here
+# removed every PATH directory that held an interpreter, which on Linux is
+# /usr/bin — so jq, awk and sed went too. The bar then parsed the payload with
+# no jq at all, fell back to an empty object, and printed $0.0000: the very
+# assertion below failed, but for a reason that had nothing to do with python,
+# while the neighbouring "nothing is written" cases kept passing because they
+# only look at cost-state.json. Windows happened to survive it because python3
+# lives in WindowsApps and Python312, leaving /usr/bin intact.
+#
+# So shadow the interpreters instead of removing their directories. The stubs
+# sit first on PATH and answer any lookup of python3/python; everything the
+# status line actually needs (jq, awk, sed, date, tput, ...) is forwarded to
+# its real path by name, so the render is exactly as capable as a normal one
+# except that no interpreter can be found.
 NOSH="$TMP/no-python"
 mkdir -p "$NOSH"
 for n in python3 python; do
   printf '#!/bin/sh\necho "Python was not found"\nexit 0\n' > "$NOSH/$n"
   chmod +x "$NOSH/$n"
 done
+# Each shim execs its target by absolute path: exec'ing by name would look the
+# name up on PATH again and land back on the shim.
+for b in bash sh jq awk sed grep cat cut tr wc head tail date mkdir stat tput cp \
+         mktemp uname dirname basename sort id cygpath which; do
+  p=$(command -v "$b" 2>/dev/null) || continue
+  [[ -n "$p" ]] || continue
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$p" > "$NOSH/$b"
+  chmod +x "$NOSH/$b"
+done
 NOSH_PATH="$NOSH"
-while IFS= read -r d; do
-  [[ -n "$d" ]] || continue
-  if [[ -x "$d/python3" || -x "$d/python" || -x "$d/python.exe" || -x "$d/python3.exe" ]]; then
-    continue                       # a real interpreter lives here: drop the dir
-  fi
-  NOSH_PATH="$NOSH_PATH:$d"
-done < <(printf '%s' "$PATH" | tr ':' '\n')
 rm -f "$PET_DIR/cost-state.json"
 nopy_out="$(HOME="$TMP" PATH="$NOSH_PATH" PET_FX_UPDATE=0 PET_PRICING_UPDATE=0 \
   PET_PRICING_COST=1 bash "$SL" <<< "$WIN_PAYLOAD" 2>"$TMP/nopy.err" | sed 's/\x1b\[[0-9;]*m//g')"

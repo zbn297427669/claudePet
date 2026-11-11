@@ -12,6 +12,19 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AUDIT="${PET_COST_AUDIT:-$ROOT/scripts/pet-cost-audit.py}"
 
+# On Windows `python3` is the Microsoft Store stub: it answers `command -v`,
+# prints "Python was not found" and exits non-zero, so the fixture below came
+# out missing and every assertion failed on empty output. Probe for a real
+# interpreter instead of assuming the name.
+PET_PY_TEST=""
+for c in python3 python; do
+  if "$c" -c 'import sys;sys.stdout.write("PETPY")' 2>/dev/null | grep -q PETPY; then
+    PET_PY_TEST="$(command -v "$c")"; break
+  fi
+done
+[[ -n "$PET_PY_TEST" ]] || { echo "  FAIL no working python interpreter found" >&2; exit 1; }
+py() { "$PET_PY_TEST" "$@"; }
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 PASS=0
@@ -32,7 +45,7 @@ cat > "$CONFIG" <<'JSON'
 JSON
 
 TRANSCRIPT="$WORK/sess-abc.jsonl"
-python3 - "$TRANSCRIPT" <<'PY'
+py - "$TRANSCRIPT" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -59,7 +72,7 @@ PY
 
 echo "── pet-cost-audit.py ──"
 
-json_out="$(python3 -I "$AUDIT" --transcript "$TRANSCRIPT" --config "$CONFIG" --json 2>&1)"
+json_out="$(py -I "$AUDIT" --transcript "$TRANSCRIPT" --config "$CONFIG" --json 2>&1)"
 if [[ -z "$json_out" ]]; then
   bad "runs against a transcript" "$json_out"
 else
@@ -75,13 +88,13 @@ else
 fi
 
 # and the human-readable path, which is what a type error would have broken
-human="$(python3 -I "$AUDIT" --transcript "$TRANSCRIPT" --config "$CONFIG" 2>&1)"
+human="$(py -I "$AUDIT" --transcript "$TRANSCRIPT" --config "$CONFIG" 2>&1)"
 if [[ -n "$human" ]]; then ok "renders the report"; else bad "renders the report" "no output"; fi
 case "$human" in *"cache reads are"*) ok "reports the cache share" ;;
                  *) bad "reports the cache share" "$human" ;; esac
 
 # --paid reconciles against a billed amount
-paid="$(python3 -I "$AUDIT" --transcript "$TRANSCRIPT" --config "$CONFIG" --paid 0.10 2>&1)"
+paid="$(py -I "$AUDIT" --transcript "$TRANSCRIPT" --config "$CONFIG" --paid 0.10 2>&1)"
 case "$paid" in *"implied"*) ok "--paid reconciles" ;; *) bad "--paid reconciles" "$paid" ;; esac
 
 echo

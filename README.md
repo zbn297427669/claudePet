@@ -284,6 +284,33 @@ If your gateway does **not** follow DeepSeek's schedule, override it — either 
         "peak":     { "input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006 } } } } }
 ```
 
+A gateway that bills a **flat** rate needs no `peak`/`off_peak` pair — give it the
+one rate and no tier is ever applied:
+
+```json
+{ "pricing": { "models": {
+    "deepseek-v4.1-flash": { "source": "user", "context_tokens": 1048576,
+      "input_per_mtok": 0.30, "output_per_mtok": 1.20, "cache_read_per_mtok": 0.006 } } } }
+```
+
+Two models can look alike and bill very differently. A gateway may expose the same
+underlying model twice — under its own name at DeepSeek's tiered rate, and as a
+resold alias at a flat markup:
+`deepseek-v4-flash` and `deepseek-v4.1-flash` are not interchangeable. Check what
+your provider actually charges rather than assuming, because the aliases are
+frequently *not* the official card:
+
+| Rate seen | What it is |
+| - | - |
+| `$0.15 / $0.60 / $0.003` | DeepSeek off-peak |
+| `$0.30 / $1.20 / $0.006` | DeepSeek peak — also what a reseller billing "peak, always" charges |
+| something much cheaper on input and dearer on output | a reseller's own margin, not a DeepSeek rate at all |
+
+The third shape is worth catching: it looks like a bargain on the input side and
+bills more for everything the model writes. OpenRouter's catalogue is a useful
+approximation for models you cannot price otherwise, but it is not what a given
+gateway charges.
+
 ### Context window size
 
 Claude Code reports `context_window_size` as **200000** for any model it does not recognise as extended-context, which understates a gateway model — DeepSeek Flash is 1M. So the bar prefers the limit recorded on the model's entry: the `CONTEXT LENGTH` row of the DeepSeek page, or OpenRouter's `context_length` for other models. It wins only when it is **larger** than the payload's value, and when it wins the percentage is recomputed with the same input-only formula Claude Code documents (`input + cache_creation + cache_read`), so the bar, the percentage and the `used/size` numbers agree. Set `"context_window_tokens": 1000000` in `config.json` to override both.
